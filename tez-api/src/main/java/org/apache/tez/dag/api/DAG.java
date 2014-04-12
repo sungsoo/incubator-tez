@@ -17,7 +17,9 @@
  */
 package org.apache.tez.dag.api;
 
+import java.net.URI;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -28,36 +30,52 @@ import java.util.Map.Entry;
 import java.util.Set;
 import java.util.Stack;
 
+import org.apache.commons.collections4.BidiMap;
+import org.apache.commons.collections4.bidimap.DualLinkedHashBidiMap;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.yarn.api.records.LocalResource;
 import org.apache.hadoop.yarn.api.records.LocalResourceType;
 import org.apache.hadoop.yarn.api.records.Resource;
+import org.apache.tez.common.impl.LogUtils;
+import org.apache.tez.dag.api.EdgeProperty.DataMovementType;
 import org.apache.tez.dag.api.EdgeProperty.DataSourceType;
 import org.apache.tez.dag.api.EdgeProperty.SchedulingType;
+import org.apache.tez.dag.api.VertexGroup.GroupInfo;
 import org.apache.tez.dag.api.VertexLocationHint.TaskLocationHint;
 import org.apache.tez.dag.api.records.DAGProtos.ConfigurationProto;
 import org.apache.tez.dag.api.records.DAGProtos.DAGPlan;
 import org.apache.tez.dag.api.records.DAGProtos.EdgePlan;
+import org.apache.tez.dag.api.records.DAGProtos.PlanGroupInputEdgeInfo;
 import org.apache.tez.dag.api.records.DAGProtos.PlanKeyValuePair;
 import org.apache.tez.dag.api.records.DAGProtos.PlanLocalResource;
 import org.apache.tez.dag.api.records.DAGProtos.PlanTaskConfiguration;
 import org.apache.tez.dag.api.records.DAGProtos.PlanTaskLocationHint;
+import org.apache.tez.dag.api.records.DAGProtos.PlanVertexGroupInfo;
 import org.apache.tez.dag.api.records.DAGProtos.PlanVertexType;
 import org.apache.tez.dag.api.records.DAGProtos.VertexPlan;
 
-import com.google.common.collect.BiMap;
-import com.google.common.collect.HashBiMap;
-
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 
 public class DAG { // FIXME rename to Topology
-  final BiMap<String, Vertex> vertices;
-  final List<Edge> edges;
+  
+  private static final Log LOG = LogFactory.getLog(DAG.class);
+  
+  final BidiMap<String, Vertex> vertices = 
+      new DualLinkedHashBidiMap<String, Vertex>();
+  final Set<Edge> edges = Sets.newHashSet();
   final String name;
+  final Collection<URI> urisForCredentials = new HashSet<URI>();
+  Credentials credentials;
+  Set<VertexGroup> vertexGroups = Sets.newHashSet();
+  Set<GroupInputEdge> groupInputEdges = Sets.newHashSet();
 
   public DAG(String name) {
-    this.vertices = HashBiMap.<String, Vertex>create();
-    this.edges = new ArrayList<Edge>();
     this.name = name;
   }
 
@@ -73,7 +91,71 @@ public class DAG { // FIXME rename to Topology
   public synchronized Vertex getVertex(String vertexName) {
     return vertices.get(vertexName);
   }
+  
+  /**
+   * One of the methods that can be used to provide information about required
+   * Credentials when running on a secure cluster. A combination of this and
+   * addURIsForCredentials should be used to specify information about all
+   * credentials required by a DAG. AM specific credentials are not used when
+   * executing a DAG.
+   * 
+   * Set credentials which will be required to run this dag. This method can be
+   * used if the client has already obtained some or all of the required
+   * credentials.
+   * 
+   * @param credentials Credentials for the DAG
+   * @return this
+   */
+  public synchronized DAG setCredentials(Credentials credentials) {
+    this.credentials = credentials;
+    return this;
+  }
+  
+  public synchronized VertexGroup createVertexGroup(String name, Vertex... members) {
+    VertexGroup uv = new VertexGroup(name, members);
+    vertexGroups.add(uv);
+    return uv;
+  }
 
+  @Private
+  public synchronized Credentials getCredentials() {
+    return this.credentials;
+  }
+
+  /**
+   * One of the methods that can be used to provide information about required
+   * Credentials when running on a secure cluster. A combination of this and
+   * setCredentials should be used to specify information about all credentials
+   * required by a DAG. AM specific credentials are not used when executing a
+   * DAG.
+   * 
+   * This method can be used to specify a list of URIs for which Credentials
+   * need to be obtained so that the job can run. An incremental list of URIs
+   * can be provided by making multiple calls to the method.
+   * 
+   * Currently, credentials can only be fetched for HDFS and other
+   * {@link org.apache.hadoop.fs.FileSystem} implementations.
+   * 
+   * @param uris
+   *          a list of {@link URI}s
+   * @return the DAG instance being used
+   */
+  public synchronized DAG addURIsForCredentials(Collection<URI> uris) {
+    Preconditions.checkNotNull(uris, "URIs cannot be null");
+    urisForCredentials.addAll(uris);
+    return this;
+  }
+
+  /**
+   * 
+   * @return an unmodifiable list representing the URIs for which credentials
+   *         are required.
+   */
+  @Private
+  public synchronized Collection<URI> getURIsForCredentials() {
+    return Collections.unmodifiableCollection(urisForCredentials);
+  }
+  
   @Private
   public synchronized Set<Vertex> getVertices() {
     return Collections.unmodifiableSet(this.vertices.values());
@@ -94,16 +176,65 @@ public class DAG { // FIXME rename to Topology
         "Edge " + edge + " already defined!");
     }
 
-    // Inform the vertices
-    edge.getInputVertex().addOutputVertex(edge.getOutputVertex(), edge.getId());
-    edge.getOutputVertex().addInputVertex(edge.getInputVertex(), edge.getId());
+    // inform the vertices
+    edge.getInputVertex().addOutputVertex(edge.getOutputVertex(), edge);
+    edge.getOutputVertex().addInputVertex(edge.getInputVertex(), edge);
 
     edges.add(edge);
     return this;
   }
+  
+  public synchronized DAG addEdge(GroupInputEdge edge) {
+    // Sanity checks
+    if (!vertexGroups.contains(edge.getInputVertexGroup())) {
+      throw new IllegalArgumentException(
+        "Input vertex " + edge.getInputVertexGroup() + " doesn't exist!");
+    }
+    if (!vertices.containsValue(edge.getOutputVertex())) {
+      throw new IllegalArgumentException(
+        "Output vertex " + edge.getOutputVertex() + " doesn't exist!");
+    }
+    if (groupInputEdges.contains(edge)) {
+      throw new IllegalArgumentException(
+        "Edge " + edge + " already defined!");
+    }
 
+    VertexGroup av = edge.getInputVertexGroup();
+    av.addOutputVertex(edge.getOutputVertex(), edge);
+    groupInputEdges.add(edge);
+    return this;
+  }
+  
   public String getName() {
     return this.name;
+  }
+  
+  private void processEdgesAndGroups() throws IllegalStateException {
+    // process all VertexGroups by transferring outgoing connections to the members
+    
+    // add edges between VertexGroup members and destination vertices
+    List<Edge> newEdges = Lists.newLinkedList();
+    for (GroupInputEdge e : groupInputEdges) {
+      Vertex  dstVertex = e.getOutputVertex();
+      VertexGroup uv = e.getInputVertexGroup();
+      for (Vertex member : uv.getMembers()) {
+        newEdges.add(new Edge(member, dstVertex, e.getEdgeProperty()));
+      }
+      dstVertex.addGroupInput(uv.getGroupName(), uv.getGroupInfo());
+    }
+    
+    for (Edge e : newEdges) {
+      addEdge(e);
+    }
+    
+    // add outputs to VertexGroup members
+    for(VertexGroup av : vertexGroups) {
+      for (RootInputLeafOutput<OutputDescriptor> output : av.getOutputs()) {
+        for (Vertex member : av.getMembers()) {
+          member.addAdditionalOutput(output);
+        }
+      }
+    }
   }
 
   // AnnotatedVertex is used by verify()
@@ -114,13 +245,11 @@ public class DAG { // FIXME rename to Topology
     int lowlink; //for Tarjan's algorithm
     boolean onstack; //for Tarjan's algorithm
 
-    int outDegree;
 
     private AnnotatedVertex(Vertex v) {
       this.v = v;
       index = -1;
       lowlink = -1;
-      outDegree = 0;
     }
   }
 
@@ -152,6 +281,8 @@ public class DAG { // FIXME rename to Topology
       throw new IllegalStateException("Invalid dag containing 0 vertices");
     }
 
+    processEdgesAndGroups();
+    
     // check for valid vertices, duplicate vertex names,
     // and prepare for cycle detection
     Map<String, AnnotatedVertex> vertexMap = new HashMap<String, AnnotatedVertex>();
@@ -250,7 +381,6 @@ public class DAG { // FIXME rename to Topology
 
     if (restricted) {
       for (Edge e : edges) {
-        vertexMap.get(e.getInputVertex().getVertexName()).outDegree++;
         if (e.getEdgeProperty().getDataSourceType() !=
           DataSourceType.PERSISTED) {
           throw new IllegalStateException(
@@ -334,6 +464,25 @@ public class DAG { // FIXME rename to Topology
     DAGPlan.Builder dagBuilder = DAGPlan.newBuilder();
 
     dagBuilder.setName(this.name);
+    
+    if (!vertexGroups.isEmpty()) {
+      for (VertexGroup av : vertexGroups) {
+        GroupInfo groupInfo = av.getGroupInfo();
+        PlanVertexGroupInfo.Builder groupBuilder = PlanVertexGroupInfo.newBuilder();
+        groupBuilder.setGroupName(groupInfo.getGroupName());
+        for (Vertex v : groupInfo.getMembers()) {
+          groupBuilder.addGroupMembers(v.getVertexName());
+        }
+        groupBuilder.addAllOutputs(groupInfo.outputs);
+        for (Map.Entry<String, InputDescriptor> entry : 
+             groupInfo.edgeMergedInputs.entrySet()) {
+          groupBuilder.addEdgeMergedInputs(
+              PlanGroupInputEdgeInfo.newBuilder().setDestVertexName(entry.getKey()).
+              setMergedInput(DagTypeConverters.convertToDAGPlan(entry.getValue())));
+        }
+        dagBuilder.addVertexGroups(groupBuilder); 
+      }
+    }
 
     for (Vertex vertex : vertices.values()) {
       VertexPlan.Builder vertexBuilder = VertexPlan.newBuilder();
@@ -362,39 +511,35 @@ public class DAG { // FIXME rename to Topology
 
       taskConfigBuilder.setTaskModule(vertex.getVertexName());
       PlanLocalResource.Builder localResourcesBuilder = PlanLocalResource.newBuilder();
-      if (vertex.getTaskLocalResources() != null) {
-        localResourcesBuilder.clear();
-        for (Entry<String, LocalResource> entry :
-          vertex.getTaskLocalResources().entrySet()) {
-          String key = entry.getKey();
-          LocalResource lr = entry.getValue();
-          localResourcesBuilder.setName(key);
-          localResourcesBuilder.setUri(
-            DagTypeConverters.convertToDAGPlan(lr.getResource()));
-          localResourcesBuilder.setSize(lr.getSize());
-          localResourcesBuilder.setTimeStamp(lr.getTimestamp());
-          localResourcesBuilder.setType(
-            DagTypeConverters.convertToDAGPlan(lr.getType()));
-          localResourcesBuilder.setVisibility(
-            DagTypeConverters.convertToDAGPlan(lr.getVisibility()));
-          if (lr.getType() == LocalResourceType.PATTERN) {
-            if (lr.getPattern() == null || lr.getPattern().isEmpty()) {
-              throw new TezUncheckedException("LocalResource type set to pattern"
-                + " but pattern is null or empty");
-            }
-            localResourcesBuilder.setPattern(lr.getPattern());
+      localResourcesBuilder.clear();
+      for (Entry<String, LocalResource> entry :
+             vertex.getTaskLocalResources().entrySet()) {
+        String key = entry.getKey();
+        LocalResource lr = entry.getValue();
+        localResourcesBuilder.setName(key);
+        localResourcesBuilder.setUri(
+          DagTypeConverters.convertToDAGPlan(lr.getResource()));
+        localResourcesBuilder.setSize(lr.getSize());
+        localResourcesBuilder.setTimeStamp(lr.getTimestamp());
+        localResourcesBuilder.setType(
+          DagTypeConverters.convertToDAGPlan(lr.getType()));
+        localResourcesBuilder.setVisibility(
+          DagTypeConverters.convertToDAGPlan(lr.getVisibility()));
+        if (lr.getType() == LocalResourceType.PATTERN) {
+          if (lr.getPattern() == null || lr.getPattern().isEmpty()) {
+            throw new TezUncheckedException("LocalResource type set to pattern"
+              + " but pattern is null or empty");
           }
-          taskConfigBuilder.addLocalResource(localResourcesBuilder);
+          localResourcesBuilder.setPattern(lr.getPattern());
         }
+        taskConfigBuilder.addLocalResource(localResourcesBuilder);
       }
-
-      if (vertex.getTaskEnvironment() != null) {
-        for (String key : vertex.getTaskEnvironment().keySet()) {
-          PlanKeyValuePair.Builder envSettingBuilder = PlanKeyValuePair.newBuilder();
-          envSettingBuilder.setKey(key);
-          envSettingBuilder.setValue(vertex.getTaskEnvironment().get(key));
-          taskConfigBuilder.addEnvironmentSetting(envSettingBuilder);
-        }
+      
+      for (String key : vertex.getTaskEnvironment().keySet()) {
+        PlanKeyValuePair.Builder envSettingBuilder = PlanKeyValuePair.newBuilder();
+        envSettingBuilder.setKey(key);
+        envSettingBuilder.setValue(vertex.getTaskEnvironment().get(key));
+        taskConfigBuilder.addEnvironmentSetting(envSettingBuilder);
       }
 
       if (vertex.getTaskLocationsHint() != null) {
@@ -441,6 +586,11 @@ public class DAG { // FIXME rename to Topology
       edgeBuilder.setSchedulingType(DagTypeConverters.convertToDAGPlan(edge.getEdgeProperty().getSchedulingType()));
       edgeBuilder.setEdgeSource(DagTypeConverters.convertToDAGPlan(edge.getEdgeProperty().getEdgeSource()));
       edgeBuilder.setEdgeDestination(DagTypeConverters.convertToDAGPlan(edge.getEdgeProperty().getEdgeDestination()));
+      if (edge.getEdgeProperty().getDataMovementType() == DataMovementType.CUSTOM) {
+        if (edge.getEdgeProperty().getEdgeManagerDescriptor() != null) {
+          edgeBuilder.setEdgeManager(DagTypeConverters.convertToDAGPlan(edge.getEdgeProperty().getEdgeManagerDescriptor()));
+        } // else the AM will deal with this.
+      }
       dagBuilder.addEdge(edgeBuilder);
     }
 
@@ -457,7 +607,10 @@ public class DAG { // FIXME rename to Topology
       }
       dagBuilder.setDagKeyValues(confProtoBuilder);
     }
-
+    if (credentials != null) {
+      dagBuilder.setCredentialsBinary(DagTypeConverters.convertCredentialsToProto(credentials));
+      LogUtils.logCredentials(LOG, credentials, "dag");
+    }
     return dagBuilder.build();
   }
 }

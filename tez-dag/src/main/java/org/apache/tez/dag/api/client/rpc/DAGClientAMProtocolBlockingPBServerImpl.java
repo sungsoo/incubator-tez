@@ -19,7 +19,9 @@
 package org.apache.tez.dag.api.client.rpc;
 
 import java.util.List;
+import java.util.Map;
 
+import org.apache.hadoop.yarn.api.records.LocalResource;
 import org.apache.tez.client.TezSessionStatus;
 import org.apache.tez.dag.api.DagTypeConverters;
 import org.apache.tez.dag.api.TezException;
@@ -27,7 +29,6 @@ import org.apache.tez.dag.api.client.DAGStatus;
 import org.apache.tez.dag.api.client.DAGStatusBuilder;
 import org.apache.tez.dag.api.client.VertexStatus;
 import org.apache.tez.dag.api.client.VertexStatusBuilder;
-import org.apache.tez.dag.api.client.rpc.DAGClientAMProtocolBlockingPB;
 import org.apache.tez.dag.api.client.rpc.DAGClientAMProtocolRPC.GetAMStatusRequestProto;
 import org.apache.tez.dag.api.client.rpc.DAGClientAMProtocolRPC.GetAMStatusResponseProto;
 import org.apache.tez.dag.api.client.rpc.DAGClientAMProtocolRPC.GetAllDAGsRequestProto;
@@ -36,6 +37,8 @@ import org.apache.tez.dag.api.client.rpc.DAGClientAMProtocolRPC.GetDAGStatusRequ
 import org.apache.tez.dag.api.client.rpc.DAGClientAMProtocolRPC.GetDAGStatusResponseProto;
 import org.apache.tez.dag.api.client.rpc.DAGClientAMProtocolRPC.GetVertexStatusRequestProto;
 import org.apache.tez.dag.api.client.rpc.DAGClientAMProtocolRPC.GetVertexStatusResponseProto;
+import org.apache.tez.dag.api.client.rpc.DAGClientAMProtocolRPC.PreWarmRequestProto;
+import org.apache.tez.dag.api.client.rpc.DAGClientAMProtocolRPC.PreWarmResponseProto;
 import org.apache.tez.dag.api.client.rpc.DAGClientAMProtocolRPC.ShutdownSessionRequestProto;
 import org.apache.tez.dag.api.client.rpc.DAGClientAMProtocolRPC.ShutdownSessionResponseProto;
 import org.apache.tez.dag.api.client.rpc.DAGClientAMProtocolRPC.SubmitDAGRequestProto;
@@ -48,8 +51,7 @@ import org.apache.tez.dag.app.DAGAppMaster.DAGClientHandler;
 import com.google.protobuf.RpcController;
 import com.google.protobuf.ServiceException;
 
-public class DAGClientAMProtocolBlockingPBServerImpl implements
-    DAGClientAMProtocolBlockingPB {
+public class DAGClientAMProtocolBlockingPBServerImpl implements DAGClientAMProtocolBlockingPB {
 
   DAGClientHandler real;
 
@@ -121,7 +123,12 @@ public class DAGClientAMProtocolBlockingPBServerImpl implements
       SubmitDAGRequestProto request) throws ServiceException {
     try{
       DAGPlan dagPlan = request.getDAGPlan();
-      String dagId = real.submitDAG(dagPlan);
+      Map<String, LocalResource> additionalResources = null;
+      if (request.hasAdditionalAmResources()) {
+        additionalResources = DagTypeConverters.convertFromPlanLocalResources(request
+            .getAdditionalAmResources());
+      }
+      String dagId = real.submitDAG(dagPlan, additionalResources);
       return SubmitDAGResponseProto.newBuilder().setDagId(dagId).build();
     } catch(TezException e) {
       throw wrapException(e);
@@ -152,4 +159,17 @@ public class DAGClientAMProtocolBlockingPBServerImpl implements
     }
   }
 
+  @Override
+  public DAGClientAMProtocolRPC.PreWarmResponseProto preWarm(
+    RpcController controller,
+    PreWarmRequestProto request) throws ServiceException {
+    try {
+      real.preWarmContainers(
+        DagTypeConverters.convertPreWarmContextFromProto(
+          request.getPreWarmContext()));
+      return PreWarmResponseProto.newBuilder().build();
+    } catch (TezException e) {
+      throw wrapException(e);
+    }
+  }
 }

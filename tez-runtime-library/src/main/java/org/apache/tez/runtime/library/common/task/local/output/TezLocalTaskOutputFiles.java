@@ -207,13 +207,13 @@ public class TezLocalTaskOutputFiles extends TezTaskOutput {
       throws IOException {
     return lDirAlloc.getLocalPathToRead(String.format(
         Constants.TEZ_RUNTIME_TASK_INPUT_FILE_FORMAT_STRING, 
-        Constants.TEZ_RUNTIME_TASK_OUTPUT_DIR, Integer.valueOf(mapId.getInputIdentifier().getSrcTaskIndex())), conf);
+        Constants.TEZ_RUNTIME_TASK_OUTPUT_DIR, Integer.valueOf(mapId.getInputIdentifier().getInputIndex())), conf);
   }
 
   /**
    * Create a local reduce input file name.
    *
-   * @param mapId a map task id
+   * @param taskId a task id
    * @param size the size of the file
    * @return path
    * @throws IOException

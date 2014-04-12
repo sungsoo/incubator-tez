@@ -61,6 +61,7 @@ import org.apache.hadoop.yarn.api.records.URL;
 import org.apache.hadoop.yarn.event.Event;
 import org.apache.hadoop.yarn.event.EventHandler;
 import org.apache.tez.common.security.JobTokenIdentifier;
+import org.apache.tez.common.security.TokenCache;
 import org.apache.tez.dag.app.AppContext;
 import org.apache.tez.dag.app.ContainerHeartbeatHandler;
 import org.apache.tez.dag.app.ContainerContext;
@@ -76,7 +77,6 @@ import org.apache.tez.dag.records.TezTaskAttemptID;
 import org.apache.tez.dag.records.TezTaskID;
 import org.apache.tez.dag.records.TezVertexID;
 import org.apache.tez.runtime.api.impl.TaskSpec;
-import org.apache.tez.runtime.library.common.security.TokenCache;
 import org.junit.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.invocation.InvocationOnMock;
@@ -136,8 +136,7 @@ public class TestAMContainer {
 
     wc.containerCompleted(false);
     wc.verifyState(AMContainerState.COMPLETED);
-    // 1 Scheduler completed event.
-    wc.verifyCountAndGetOutgoingEvents(1);
+    wc.verifyNoOutgoingEvents();
     verify(wc.tal).unregisterRunningContainer(wc.containerID);
     verify(wc.chh).unregister(wc.containerID);
 
@@ -192,8 +191,7 @@ public class TestAMContainer {
 
     wc.containerCompleted(false);
     wc.verifyState(AMContainerState.COMPLETED);
-    // 1 Scheduler completed event.
-    wc.verifyCountAndGetOutgoingEvents(1);
+    wc.verifyNoOutgoingEvents();
     verify(wc.tal).unregisterRunningContainer(wc.containerID);
     verify(wc.chh).unregister(wc.containerID);
 
@@ -226,8 +224,7 @@ public class TestAMContainer {
 
     wc.containerCompleted(false);
     wc.verifyState(AMContainerState.COMPLETED);
-    // 1 Scheduler completed event.
-    wc.verifyCountAndGetOutgoingEvents(1);
+    wc.verifyNoOutgoingEvents();
     verify(wc.tal).unregisterRunningContainer(wc.containerID);
     verify(wc.chh).unregister(wc.containerID);
 
@@ -265,8 +262,7 @@ public class TestAMContainer {
 
     wc.containerCompleted(false);
     wc.verifyState(AMContainerState.COMPLETED);
-    // 1 Scheduler completed event.
-    wc.verifyCountAndGetOutgoingEvents(1);
+    wc.verifyNoOutgoingEvents();
     verify(wc.tal).unregisterRunningContainer(wc.containerID);
     verify(wc.chh).unregister(wc.containerID);
 
@@ -304,11 +300,10 @@ public class TestAMContainer {
     wc.nmStopSent();
     wc.containerCompleted(false);
     // 1 Inform scheduler. 2 TERMINATED to TaskAttempt.
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(3);
+    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(2);
     verifyUnOrderedOutgoingEventTypes(outgoingEvents,
         TaskAttemptEventType.TA_CONTAINER_TERMINATED,
-        TaskAttemptEventType.TA_CONTAINER_TERMINATED,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED);
+        TaskAttemptEventType.TA_CONTAINER_TERMINATED);
 
     assertNull(wc.amContainer.getRunningTaskAttempt());
     assertEquals(0, wc.amContainer.getQueuedTaskAttempts().size());
@@ -344,11 +339,10 @@ public class TestAMContainer {
     wc.nmStopSent();
     wc.containerCompleted(false);
     // 1 Inform scheduler. 2 TERMINATED to TaskAttempt.
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(3);
+    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(2);
     verifyUnOrderedOutgoingEventTypes(outgoingEvents,
         TaskAttemptEventType.TA_CONTAINER_TERMINATED,
-        TaskAttemptEventType.TA_CONTAINER_TERMINATED,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED);
+        TaskAttemptEventType.TA_CONTAINER_TERMINATED);
 
     assertNull(wc.amContainer.getRunningTaskAttempt());
     assertEquals(0, wc.amContainer.getQueuedTaskAttempts().size());
@@ -383,11 +377,10 @@ public class TestAMContainer {
     wc.nmStopSent();
     wc.containerCompleted(false);
     // 1 Inform scheduler. 2 TERMINATED to TaskAttempt.
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(3);
+    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(2);
     verifyUnOrderedOutgoingEventTypes(outgoingEvents,
         TaskAttemptEventType.TA_CONTAINER_TERMINATED,
-        TaskAttemptEventType.TA_CONTAINER_TERMINATED,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED);
+        TaskAttemptEventType.TA_CONTAINER_TERMINATED);
 
     assertNull(wc.amContainer.getRunningTaskAttempt());
     assertEquals(0, wc.amContainer.getQueuedTaskAttempts().size());
@@ -418,10 +411,9 @@ public class TestAMContainer {
     // TODO Should this be an RM DE-ALLOCATE instead ?
 
     wc.containerCompleted(false);
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(2);
+    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(1);
     verifyUnOrderedOutgoingEventTypes(outgoingEvents,
-        TaskAttemptEventType.TA_CONTAINER_TERMINATED,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED);
+        TaskAttemptEventType.TA_CONTAINER_TERMINATED);
 
     assertFalse(wc.amContainer.isInErrorState());
 
@@ -450,27 +442,22 @@ public class TestAMContainer {
         AMSchedulerEventType.S_CONTAINER_DEALLOCATE);
 
     wc.containerCompleted(false);
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(2);
+    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(1);
     verifyUnOrderedOutgoingEventTypes(outgoingEvents,
-        TaskAttemptEventType.TA_CONTAINER_TERMINATED,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED);
+        TaskAttemptEventType.TA_CONTAINER_TERMINATED);
 
     // Valid transition. Container complete, but not with an error.
     assertFalse(wc.amContainer.isInErrorState());
   }
 
-  @SuppressWarnings("rawtypes")
   @Test
   public void testContainerCompletedAtAllocated() {
     WrappedContainer wc = new WrappedContainer();
-    List<Event> outgoingEvents;
     wc.verifyState(AMContainerState.ALLOCATED);
 
     wc.containerCompleted(false);
     wc.verifyState(AMContainerState.COMPLETED);
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(1);
-    verifyUnOrderedOutgoingEventTypes(outgoingEvents,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED);
+    wc.verifyNoOutgoingEvents();
 
     assertFalse(wc.amContainer.isInErrorState());
   }
@@ -493,9 +480,8 @@ public class TestAMContainer {
     verify(wc.tal).registerRunningContainer(wc.containerID);
     verify(wc.tal).unregisterRunningContainer(wc.containerID);
 
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(2);
+    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(1);
     verifyUnOrderedOutgoingEventTypes(outgoingEvents,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED,
         TaskAttemptEventType.TA_CONTAINER_TERMINATED);
 
     assertFalse(wc.amContainer.isInErrorState());
@@ -526,9 +512,8 @@ public class TestAMContainer {
     verify(wc.chh).register(wc.containerID);
     verify(wc.chh).unregister(wc.containerID);
 
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(2);
+    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(1);
     verifyUnOrderedOutgoingEventTypes(outgoingEvents,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED,
         TaskAttemptEventType.TA_CONTAINER_TERMINATED);
 
     assertFalse(wc.amContainer.isInErrorState());
@@ -562,9 +547,8 @@ public class TestAMContainer {
     verify(wc.chh).register(wc.containerID);
     verify(wc.chh).unregister(wc.containerID);
 
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(2);
+    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(1);
     verifyUnOrderedOutgoingEventTypes(outgoingEvents,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED,
         TaskAttemptEventType.TA_CONTAINER_TERMINATED);
 
     assertFalse(wc.amContainer.isInErrorState());
@@ -598,9 +582,8 @@ public class TestAMContainer {
     verify(wc.chh).register(wc.containerID);
     verify(wc.chh).unregister(wc.containerID);
 
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(2);
+    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(1);
     verifyUnOrderedOutgoingEventTypes(outgoingEvents,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED,
         TaskAttemptEventType.TA_CONTAINER_PREEMPTED);
 
     assertFalse(wc.amContainer.isInErrorState());
@@ -685,10 +668,9 @@ public class TestAMContainer {
     }
 
     wc.containerCompleted(false);
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(2);
+    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(1);
     verifyUnOrderedOutgoingEventTypes(outgoingEvents,
-        TaskAttemptEventType.TA_CONTAINER_TERMINATED,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED);
+        TaskAttemptEventType.TA_CONTAINER_TERMINATED);
 
     assertFalse(wc.amContainer.isInErrorState());
   }
@@ -731,9 +713,7 @@ public class TestAMContainer {
     assertFalse(wc.amContainer.isInErrorState());
 
     wc.containerCompleted(false);
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(1);
-    verifyUnOrderedOutgoingEventTypes(outgoingEvents,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED);
+    wc.verifyNoOutgoingEvents();
 
     assertNull(wc.amContainer.getRunningTaskAttempt());
     assertEquals(0, wc.amContainer.getQueuedTaskAttempts().size());
@@ -775,10 +755,9 @@ public class TestAMContainer {
     }
 
     wc.containerCompleted(false);
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(2);
+    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(1);
     verifyUnOrderedOutgoingEventTypes(outgoingEvents,
-        TaskAttemptEventType.TA_CONTAINER_TERMINATED,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED);
+        TaskAttemptEventType.TA_CONTAINER_TERMINATED);
 
     assertFalse(wc.amContainer.isInErrorState());
     assertNull(wc.amContainer.getRunningTaskAttempt());
@@ -818,11 +797,9 @@ public class TestAMContainer {
     assertEquals(2, wc.amContainer.getAllTaskAttempts().size());
   }
 
-  @SuppressWarnings("rawtypes")
   @Test
   public void testDuplicateCompletedEvents() {
     WrappedContainer wc = new WrappedContainer();
-    List<Event> outgoingEvents;
 
     wc.launchContainer();
     wc.containerLaunched();
@@ -839,9 +816,7 @@ public class TestAMContainer {
     wc.containerCompleted(false);
     wc.verifyState(AMContainerState.COMPLETED);
 
-    outgoingEvents = wc.verifyCountAndGetOutgoingEvents(1);
-    verifyUnOrderedOutgoingEventTypes(outgoingEvents,
-        AMSchedulerEventType.S_CONTAINER_COMPLETED);
+    wc.verifyNoOutgoingEvents();
 
     wc.containerCompleted(false);
     wc.verifyNoOutgoingEvents();
@@ -930,7 +905,7 @@ public class TestAMContainer {
     Token<TokenIdentifier> token3 = mock(Token.class);
     
     Credentials containerCredentials = new Credentials();
-    TokenCache.setJobToken(amGenToken, containerCredentials);
+    TokenCache.setSessionToken(amGenToken, containerCredentials);
 
     Text token1Name = new Text("tokenDag1");
     Text token3Name = new Text("tokenDag3");
@@ -1108,7 +1083,7 @@ public class TestAMContainer {
       reset(eventHandler);
       @SuppressWarnings("unchecked")
       Token<JobTokenIdentifier> jobToken = mock(Token.class);
-      TokenCache.setJobToken(jobToken, credentials);
+      TokenCache.setSessionToken(jobToken, credentials);
       amContainer.handle(new AMContainerEventLaunchRequest(containerID, vertexID,
           new ContainerContext(localResources, credentials, new HashMap<String, String>(), "")));
     }

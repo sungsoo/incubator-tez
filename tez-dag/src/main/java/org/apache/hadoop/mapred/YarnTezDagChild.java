@@ -20,22 +20,19 @@ package org.apache.hadoop.mapred;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
-import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.io.PrintStream;
 import java.net.InetSocketAddress;
+import java.net.URI;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -58,7 +55,6 @@ import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.yarn.YarnUncaughtExceptionHandler;
 import org.apache.hadoop.yarn.api.ApplicationConstants;
 import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
-import org.apache.log4j.Appender;
 import org.apache.log4j.LogManager;
 import org.apache.log4j.Logger;
 import org.apache.tez.common.ContainerContext;
@@ -69,12 +65,13 @@ import org.apache.tez.common.TezTaskUmbilicalProtocol;
 import org.apache.tez.common.TezUtils;
 import org.apache.tez.common.counters.Limits;
 import org.apache.tez.common.security.JobTokenIdentifier;
+import org.apache.tez.common.security.TokenCache;
 import org.apache.tez.dag.api.TezConfiguration;
 import org.apache.tez.dag.api.TezException;
 import org.apache.tez.dag.records.TezTaskAttemptID;
 import org.apache.tez.dag.records.TezVertexID;
+import org.apache.tez.dag.utils.RelocalizationUtils;
 import org.apache.tez.runtime.LogicalIOProcessorRuntimeTask;
-import org.apache.tez.runtime.RuntimeUtils;
 import org.apache.tez.runtime.api.events.TaskAttemptCompletedEvent;
 import org.apache.tez.runtime.api.events.TaskAttemptFailedEvent;
 import org.apache.tez.runtime.api.events.TaskStatusUpdateEvent;
@@ -88,10 +85,13 @@ import org.apache.tez.runtime.api.impl.TezUmbilical;
 import org.apache.tez.runtime.common.objectregistry.ObjectLifeCycle;
 import org.apache.tez.runtime.common.objectregistry.ObjectRegistryImpl;
 import org.apache.tez.runtime.common.objectregistry.ObjectRegistryModule;
-import org.apache.tez.runtime.library.common.security.TokenCache;
 import org.apache.tez.runtime.library.shuffle.common.ShuffleUtils;
 
+import com.google.common.base.Function;
+import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Multimap;
 import com.google.inject.Guice;
 import com.google.inject.Injector;
 
@@ -119,6 +119,18 @@ public class YarnTezDagChild {
   private static Throwable heartbeatErrorException = null;
   // Implies that the task is done - and the AM is being informed.
   private static AtomicBoolean currentTaskComplete = new AtomicBoolean(true);
+  /**
+   * Used to maintain information about which Inputs have been started by the
+   * framework for the specific DAG. Makes an assumption that multiple DAGs do
+   * not execute concurrently, and must be reset each time the running DAG
+   * changes.
+   */
+  private static Multimap<String, String> startedInputsMap = HashMultimap.create();
+  
+  private static final int LOG_COUNTER_START_INTERVAL = 5000; // 5 seconds.
+  private static final float LOG_COUNTER_BACKOFF = 1.3f;
+  private static int taskNonOobHeartbeatCounter = 0;
+  private static int nextHeartbeatNumToLog = 0;
 
   private static Thread startHeartbeatThread() {
     Thread heartbeatThread = new Thread(new Runnable() {
@@ -221,6 +233,22 @@ public class YarnTezDagChild {
       taskLock.readLock().unlock();
     }
 
+    if (LOG.isDebugEnabled()) {
+      taskNonOobHeartbeatCounter++;
+      if (taskNonOobHeartbeatCounter == nextHeartbeatNumToLog) {
+        taskLock.readLock().lock();
+        try {
+          if (currentTask != null) {
+            LOG.debug("Counters: " + currentTask.getCounters().toShortString());
+            taskNonOobHeartbeatCounter = 0;
+            nextHeartbeatNumToLog = (int) (nextHeartbeatNumToLog * (LOG_COUNTER_BACKOFF));
+          }
+        } finally {
+          taskLock.readLock().unlock();
+        }
+      }
+    }
+
     long reqId = requestCounter.incrementAndGet();
     TezHeartbeatRequest request = new TezHeartbeatRequest(reqId, events,
         containerIdStr, taskAttemptID, eventCounter, eventsRange);
@@ -267,7 +295,7 @@ public class YarnTezDagChild {
     }
     return true;
   }
-
+  
   public static void main(String[] args) throws Throwable {
     Thread.setDefaultUncaughtExceptionHandler(
         new YarnUncaughtExceptionHandler());
@@ -324,7 +352,7 @@ public class YarnTezDagChild {
     UserGroupInformation taskOwner =
       UserGroupInformation.createRemoteUser(tokenIdentifier);
 
-    Token<JobTokenIdentifier> jobToken = TokenCache.getJobToken(credentials);
+    Token<JobTokenIdentifier> jobToken = TokenCache.getSessionToken(credentials);
     SecurityUtil.setTokenService(jobToken, address);
     taskOwner.addToken(jobToken);
     // Will jobToken change across DAGs ?
@@ -353,6 +381,13 @@ public class YarnTezDagChild {
       public void signalFatalError(TezTaskAttemptID taskAttemptID,
           String diagnostics,
           EventMetaData sourceInfo) {
+        currentTask.setFrameworkCounters();
+        TezEvent statusUpdateEvent =
+            new TezEvent(new TaskStatusUpdateEvent(
+                currentTask.getCounters(), currentTask.getProgress()),
+                new EventMetaData(EventProducerConsumerType.SYSTEM,
+                    currentTask.getVertexName(), "",
+                    currentTask.getTaskAttemptID()));
         TezEvent taskAttemptFailedEvent =
             new TezEvent(new TaskAttemptFailedEvent(diagnostics),
                 sourceInfo);
@@ -360,7 +395,7 @@ public class YarnTezDagChild {
           // Not setting taskComplete - since the main loop responsible for cleanup doesn't have
           // control yet. Getting control depends on whether the I/P/O returns correctly after
           // reporting an error.
-          heartbeat(Collections.singletonList(taskAttemptFailedEvent));
+          heartbeat(Lists.newArrayList(statusUpdateEvent, taskAttemptFailedEvent));
         } catch (Throwable t) {
           LOG.fatal("Failed to communicate task attempt failure to AM via"
               + " umbilical", t);
@@ -399,10 +434,11 @@ public class YarnTezDagChild {
     TezVertexID lastVertexId = null;
     EventMetaData currentSourceInfo = null;
     try {
+      String loggerAddend = "";
       while (true) {
         // poll for new task
         if (taskCount > 0) {
-          updateLoggers(null);
+          TezUtils.updateLoggers(loggerAddend);
         }
         boolean isNewGetTask = true;
         long getTaskPollStartTime = System.currentTimeMillis();
@@ -435,6 +471,9 @@ public class YarnTezDagChild {
         }
         taskCount++;
 
+        // Reset FileSystem statistics
+        FileSystem.clearStatistics();
+
         // Re-use the UGI only if the Credentials have not changed.
         if (containerTask.haveCredentialsChanged()) {
           LOG.info("Refreshing UGI since Credentials have changed");
@@ -454,7 +493,18 @@ public class YarnTezDagChild {
         if (LOG.isDebugEnabled()) {
           LOG.debug("Additional Resources added to container: " + additionalResources);
         }
-        processAdditionalResources(additionalResources, defaultConf);
+
+        LOG.info("Localizing additional local resources for Task : " + additionalResources);
+        List<URL> downloadedUrls = RelocalizationUtils.processAdditionalResources(
+            Maps.transformValues(additionalResources, new Function<TezLocalResource, URI>() {
+              @Override
+              public URI apply(TezLocalResource input) {
+                return input.getUri();
+              }
+            }), defaultConf);
+        RelocalizationUtils.addUrlsToClassPath(downloadedUrls);
+
+        LOG.info("Done localizing additional resources");
         final TaskSpec taskSpec = containerTask.getTaskSpec();
         if (LOG.isDebugEnabled()) {
           LOG.debug("New container task context:"
@@ -474,13 +524,20 @@ public class YarnTezDagChild {
             }
             if (!lastVertexId.getDAGId().equals(newVertexId.getDAGId())) {
               objectRegistry.clearCache(ObjectLifeCycle.DAG);
+              startedInputsMap = HashMultimap.create();
             }
           }
           lastVertexId = newVertexId;
-          updateLoggers(currentTaskAttemptID);
-
+          TezUtils.updateLoggers(currentTaskAttemptID.toString());
+          loggerAddend = currentTaskAttemptID.toString() + "_post";
+          
           currentTask = createLogicalTask(attemptNumber, taskSpec,
               defaultConf, tezUmbilical, serviceConsumerMetadata);
+          
+          taskNonOobHeartbeatCounter = 0;
+          nextHeartbeatNumToLog = (Math.max(1,
+              (int) (LOG_COUNTER_START_INTERVAL / (amPollInterval == 0 ? 0.000001f
+                  : (float) amPollInterval))));
         } finally {
           taskLock.writeLock().unlock();
         }
@@ -516,6 +573,8 @@ public class YarnTezDagChild {
               currentTaskComplete.set(true);
               // TODONEWTEZ Should the container continue to run if the running task reported a fatal error ?
               if (!currentTask.hadFatalError()) {
+                // Set counters in case of a successful task.
+                currentTask.setFrameworkCounters();
                 TezEvent statusUpdateEvent =
                     new TezEvent(new TaskStatusUpdateEvent(
                         currentTask.getCounters(), currentTask.getProgress()),
@@ -525,7 +584,7 @@ public class YarnTezDagChild {
                 TezEvent taskCompletedEvent =
                     new TezEvent(new TaskAttemptCompletedEvent(), sourceInfo);
                 heartbeat(Arrays.asList(statusUpdateEvent, taskCompletedEvent));
-              }
+              } // Should the fatalError be reported ?
             } finally {
               currentTask.cleanup();
             }
@@ -556,14 +615,22 @@ public class YarnTezDagChild {
       try {
         taskLock.readLock().lock();
         if (currentTask != null && !currentTask.hadFatalError()) {
+          // TODO Is this of any use if the heartbeat thread is being interrupted first ?
           // Prevent dup failure events
+          currentTask.setFrameworkCounters();
+          TezEvent statusUpdateEvent =
+              new TezEvent(new TaskStatusUpdateEvent(
+                  currentTask.getCounters(), currentTask.getProgress()),
+                  new EventMetaData(EventProducerConsumerType.SYSTEM,
+                      currentTask.getVertexName(), "",
+                      currentTask.getTaskAttemptID()));
           currentTask.setFatalError(e, "FS Error in Child JVM");
           TezEvent taskAttemptFailedEvent =
               new TezEvent(new TaskAttemptFailedEvent(
                   StringUtils.stringifyException(e)),
                   currentSourceInfo);
           currentTaskComplete.set(true);
-          heartbeat(Collections.singletonList(taskAttemptFailedEvent));
+          heartbeat(Lists.newArrayList(statusUpdateEvent, taskAttemptFailedEvent));
         }
       } finally {
         taskLock.readLock().unlock();
@@ -581,13 +648,21 @@ public class YarnTezDagChild {
       taskLock.readLock().lock();
       try {
         if (currentTask != null && !currentTask.hadFatalError()) {
+          // TODO Is this of any use if the heartbeat thread is being interrupted first ?
           // Prevent dup failure events
           currentTask.setFatalError(throwable, "Error in Child JVM");
+          currentTask.setFrameworkCounters();
+          TezEvent statusUpdateEvent =
+              new TezEvent(new TaskStatusUpdateEvent(
+                  currentTask.getCounters(), currentTask.getProgress()),
+                  new EventMetaData(EventProducerConsumerType.SYSTEM,
+                      currentTask.getVertexName(), "",
+                      currentTask.getTaskAttemptID()));
           TezEvent taskAttemptFailedEvent =
             new TezEvent(new TaskAttemptFailedEvent(cause),
               currentSourceInfo);
           currentTaskComplete.set(true);
-          heartbeat(Collections.singletonList(taskAttemptFailedEvent));
+          heartbeat(Lists.newArrayList(statusUpdateEvent, taskAttemptFailedEvent));
         }
       } finally {
         taskLock.readLock().unlock();
@@ -616,7 +691,7 @@ public class YarnTezDagChild {
     LOG.info("LocalDirs for child: " + Arrays.toString(localDirs));
 
     return new LogicalIOProcessorRuntimeTask(taskSpec, attemptNum, conf,
-        tezUmbilical, serviceConsumerMetadata);
+        tezUmbilical, serviceConsumerMetadata, startedInputsMap);
   }
   
   // TODONEWTEZ Is this really required ?
@@ -640,77 +715,4 @@ public class YarnTezDagChild {
     }
   }
 
-  private static void updateLoggers(TezTaskAttemptID tezTaskAttemptID)
-      throws FileNotFoundException {
-    String containerLogDir = null;
-
-    LOG.info("Redirecting log files based on TaskAttemptId: " + tezTaskAttemptID);
-
-    Appender appender = Logger.getRootLogger().getAppender(
-        TezConfiguration.TEZ_CONTAINER_LOGGER_NAME);
-    if (appender != null) {
-      if (appender instanceof TezContainerLogAppender) {
-        TezContainerLogAppender claAppender = (TezContainerLogAppender) appender;
-        containerLogDir = claAppender.getContainerLogDir();
-        claAppender.setLogFileName(constructLogFileName(
-            TezConfiguration.TEZ_CONTAINER_LOG_FILE_NAME, tezTaskAttemptID));
-        claAppender.activateOptions();
-      } else {
-        LOG.warn("Appender is a " + appender.getClass()
-            + "; require an instance of "
-            + TezContainerLogAppender.class.getName()
-            + " to reconfigure the logger output");
-      }
-    } else {
-      LOG.warn("Not configured with appender named: "
-          + TezConfiguration.TEZ_CONTAINER_LOGGER_NAME
-          + ". Cannot reconfigure logger output");
-    }
-
-    if (containerLogDir != null) {
-      System.setOut(new PrintStream(new File(containerLogDir,
-          constructLogFileName(TezConfiguration.TEZ_CONTAINER_OUT_FILE_NAME,
-              tezTaskAttemptID))));
-      System.setErr(new PrintStream(new File(containerLogDir,
-          constructLogFileName(TezConfiguration.TEZ_CONTAINER_ERR_FILE_NAME,
-              tezTaskAttemptID))));
-    }
-  }
-
-  private static String constructLogFileName(String base,
-      TezTaskAttemptID tezTaskAttemptID) {
-    if (tezTaskAttemptID == null) {
-      return base;
-    } else {
-      return base + "_" + tezTaskAttemptID.toString();
-    }
-  }
-  
-  private static void processAdditionalResources(Map<String, TezLocalResource> additionalResources,
-      Configuration conf) throws IOException, TezException {
-    if (additionalResources == null || additionalResources.isEmpty()) {
-      return;
-    }
-
-    LOG.info("Downloading " + additionalResources.size() + "additional resources");
-    List<URL> urls = Lists.newArrayListWithCapacity(additionalResources.size());
-
-    for (Entry<String, TezLocalResource> lrEntry : additionalResources.entrySet()) {
-      Path dFile = downloadResource(lrEntry.getKey(), lrEntry.getValue(), conf);
-      urls.add(dFile.toUri().toURL());
-    }
-    RuntimeUtils.addResourcesToClasspath(urls);
-    LOG.info("Done localizing additional resources");
-  }
-
-  private static Path downloadResource(String destName, TezLocalResource resource,
-      Configuration conf) throws IOException {
-    resource.getUri();
-    FileSystem fs = FileSystem.get(resource.getUri(), conf);
-    Path cwd = new Path(System.getenv(Environment.PWD.name()));
-    Path dFile = new Path(cwd, destName);
-    Path srcPath = new Path(resource.getUri());
-    fs.copyToLocalFile(srcPath, dFile);
-    return dFile.makeQualified(FileSystem.getLocal(conf).getUri(), cwd);
-  }
 }

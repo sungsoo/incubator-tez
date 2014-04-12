@@ -20,12 +20,18 @@ package org.apache.tez.dag.app.dag.impl;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import javax.annotation.Nullable;
 import org.apache.hadoop.yarn.event.EventHandler;
+import org.apache.tez.common.RuntimeUtils;
 import org.apache.tez.dag.api.EdgeManager;
+import org.apache.tez.dag.api.EdgeManagerContext;
+import org.apache.tez.dag.api.EdgeManagerDescriptor;
 import org.apache.tez.dag.api.EdgeProperty;
 import org.apache.tez.dag.api.TezUncheckedException;
+import org.apache.tez.dag.api.EdgeProperty.DataMovementType;
 import org.apache.tez.dag.app.dag.Task;
 import org.apache.tez.dag.app.dag.Vertex;
 import org.apache.tez.dag.app.dag.event.TaskAttemptEventOutputFailed;
@@ -33,6 +39,7 @@ import org.apache.tez.dag.app.dag.event.TaskEventAddTezEvent;
 import org.apache.tez.dag.records.TezTaskAttemptID;
 import org.apache.tez.dag.records.TezTaskID;
 import org.apache.tez.runtime.api.Event;
+import org.apache.tez.runtime.api.events.CompositeDataMovementEvent;
 import org.apache.tez.runtime.api.events.DataMovementEvent;
 import org.apache.tez.runtime.api.events.InputFailedEvent;
 import org.apache.tez.runtime.api.events.InputReadErrorEvent;
@@ -42,9 +49,44 @@ import org.apache.tez.runtime.api.impl.OutputSpec;
 import org.apache.tez.runtime.api.impl.TezEvent;
 import org.apache.tez.runtime.api.impl.EventMetaData.EventProducerConsumerType;
 
+import com.google.common.collect.Maps;
+import static com.google.common.base.Preconditions.checkNotNull;
+
 public class Edge {
 
+  static class EdgeManagerContextImpl implements EdgeManagerContext {
+
+    private final String srcVertexName;
+    private final String destVertexName;
+    private final byte[] userPayload;
+
+    EdgeManagerContextImpl(String srcVertexName, String destVertexName,
+        @Nullable byte[] userPayload) {
+      checkNotNull(srcVertexName, "srcVertexName is null");
+      checkNotNull(destVertexName, "destVertexName is null");
+      this.srcVertexName = srcVertexName;
+      this.destVertexName = destVertexName;
+      this.userPayload = userPayload;
+    }
+
+    @Override
+    public byte[] getUserPayload() {
+      return userPayload;
+    }
+
+    @Override
+    public String getSrcVertexName() {
+      return srcVertexName;
+    }
+
+    @Override
+    public String getDestVertexName() {
+      return destVertexName;
+    }
+  }
+
   private EdgeProperty edgeProperty;
+  private EdgeManagerContext edgeManagerContext;
   private EdgeManager edgeManager;
   @SuppressWarnings("rawtypes")
   private EventHandler eventHandler;
@@ -53,28 +95,63 @@ public class Edge {
   private List<TezEvent> sourceEventBuffer = new ArrayList<TezEvent>();
   private Vertex sourceVertex;
   private Vertex destinationVertex; // this may end up being a list for shared edge
+  private EventMetaData destinationMetaInfo;
 
   @SuppressWarnings("rawtypes")
   public Edge(EdgeProperty edgeProperty, EventHandler eventHandler) {
     this.edgeProperty = edgeProperty;
     this.eventHandler = eventHandler;
+    createEdgeManager();
+  }
+
+  private void createEdgeManager() {
     switch (edgeProperty.getDataMovementType()) {
-    case ONE_TO_ONE:
-      edgeManager = new OneToOneEdgeManager();
-      break;
-    case BROADCAST:
-      edgeManager = new BroadcastEdgeManager();
-      break;
-    case SCATTER_GATHER:
-      edgeManager = new ScatterGatherEdgeManager();
-      break;
-    default:
-      String message = "Unknown edge data movement type: "
-          + edgeProperty.getDataMovementType();
-      throw new TezUncheckedException(message);
+      case ONE_TO_ONE:
+        edgeManager = new OneToOneEdgeManager();
+        break;
+      case BROADCAST:
+        edgeManager = new BroadcastEdgeManager();
+        break;
+      case SCATTER_GATHER:
+        edgeManager = new ScatterGatherEdgeManager();
+        break;
+      case CUSTOM:
+        String edgeManagerClassName = edgeProperty.getEdgeManagerDescriptor().getClassName();
+        edgeManager = RuntimeUtils.createClazzInstance(edgeManagerClassName);
+        break;
+      default:
+        String message = "Unknown edge data movement type: "
+            + edgeProperty.getDataMovementType();
+        throw new TezUncheckedException(message);
     }
   }
-  
+
+  public void initialize() {
+    byte[] bb = null;
+    if (edgeProperty.getDataMovementType() == DataMovementType.CUSTOM) {
+      bb = edgeProperty.getEdgeManagerDescriptor().getUserPayload();
+    }
+    edgeManagerContext = new EdgeManagerContextImpl(sourceVertex.getName(),
+        destinationVertex.getName(), bb);
+    edgeManager.initialize(edgeManagerContext);
+    destinationMetaInfo = new EventMetaData(EventProducerConsumerType.INPUT, 
+        destinationVertex.getName(), 
+        sourceVertex.getName(), 
+        null);
+  }
+
+  public synchronized void setCustomEdgeManager(EdgeManagerDescriptor descriptor) {
+    EdgeProperty modifiedEdgeProperty =
+        new EdgeProperty(descriptor,
+            edgeProperty.getDataSourceType(),
+            edgeProperty.getSchedulingType(),
+            edgeProperty.getEdgeSource(),
+            edgeProperty.getEdgeDestination());
+    this.edgeProperty = modifiedEdgeProperty;
+    createEdgeManager();
+    initialize();
+  }
+
   public EdgeProperty getEdgeProperty() {
     return this.edgeProperty;
   }
@@ -82,14 +159,7 @@ public class Edge {
   public EdgeManager getEdgeManager() {
     return this.edgeManager;
   }
-  
-  public void setEdgeManager(EdgeManager edgeManager) {
-    if(edgeManager == null) {
-      throw new TezUncheckedException("Edge manager cannot be null");
-    }
-    this.edgeManager = edgeManager;
-  }
-  
+
   public void setSourceVertex(Vertex sourceVertex) {
     if (this.sourceVertex != null && this.sourceVertex != sourceVertex) {
       throw new TezUncheckedException("Source vertex exists: "
@@ -110,14 +180,14 @@ public class Edge {
   public InputSpec getDestinationSpec(int destinationTaskIndex) {
     return new InputSpec(sourceVertex.getName(),
         edgeProperty.getEdgeDestination(),
-        edgeManager.getNumDestinationTaskInputs(sourceVertex.getTotalTasks(),
+        edgeManager.getNumDestinationTaskPhysicalInputs(sourceVertex.getTotalTasks(),
             destinationTaskIndex));
   }
 
   public OutputSpec getSourceSpec(int sourceTaskIndex) {
     return new OutputSpec(destinationVertex.getName(),
-        edgeProperty.getEdgeSource(), edgeManager.getNumSourceTaskOutputs(
-            destinationVertex.getTotalTasks(), sourceTaskIndex));
+        edgeProperty.getEdgeSource(), edgeManager.getNumSourceTaskPhysicalOutputs(
+        destinationVertex.getTotalTasks(), sourceTaskIndex));
   }
   
   public void startEventBuffering() {
@@ -146,9 +216,9 @@ public class Edge {
         TezTaskAttemptID destAttemptId = tezEvent.getSourceInfo()
             .getTaskAttemptID();
         int destTaskIndex = destAttemptId.getTaskID().getId();
-        int srcTaskIndex = edgeManager.routeEventToSourceTasks(destTaskIndex,
-            event);
-        int numConsumers = edgeManager.getDestinationConsumerTaskNumber(
+        int srcTaskIndex = edgeManager.routeInputErrorEventToSource(event,
+            destTaskIndex);
+        int numConsumers = edgeManager.getNumDestinationConsumerTasks(
             srcTaskIndex, destinationVertex.getTotalTasks());
         Task srcTask = sourceVertex.getTask(srcTaskIndex);
         if (srcTask == null) {
@@ -175,49 +245,96 @@ public class Edge {
     }
   }
   
+
+  private void handleCompositeDataMovementEvent(TezEvent tezEvent) {
+    CompositeDataMovementEvent compEvent = (CompositeDataMovementEvent) tezEvent.getEvent();
+    EventMetaData srcInfo = tezEvent.getSourceInfo();
+    
+    for (DataMovementEvent dmEvent : compEvent.getEvents()) {
+      TezEvent newEvent = new TezEvent(dmEvent, srcInfo);
+      sendTezEventToDestinationTasks(newEvent);
+    }
+  }
+  
+  void sendDmEventOrIfEventToTasks(TezEvent tezEvent, int srcTaskIndex,
+      boolean isDataMovementEvent,
+      Map<Integer, List<Integer>> ifInputIndicesToTaskIndices) {
+    int num = 0;
+    Event event = tezEvent.getEvent();
+    for (Map.Entry<Integer, List<Integer>> entry : ifInputIndicesToTaskIndices.entrySet()) {
+      ++num;
+      TezEvent tezEventToSend = null;
+      if (num == ifInputIndicesToTaskIndices.size()) {
+        if (isDataMovementEvent) {
+          ((DataMovementEvent) event).setTargetIndex(entry.getKey().intValue());
+        } else {
+          ((InputFailedEvent) event).setTargetIndex(entry.getKey().intValue());
+        }
+        tezEventToSend = tezEvent;
+      } else {
+        Event e;
+        if (isDataMovementEvent) {
+          DataMovementEvent dmEvent = (DataMovementEvent) event;
+          e = new DataMovementEvent(dmEvent.getSourceIndex(), 
+              entry.getKey().intValue(), dmEvent.getVersion(), dmEvent.getUserPayload());
+        } else {
+          InputFailedEvent ifEvent = ((InputFailedEvent) event);
+          e = new InputFailedEvent(entry.getKey().intValue(), ifEvent.getVersion());
+        }
+        tezEventToSend = new TezEvent(e, tezEvent.getSourceInfo());
+      }
+      tezEventToSend.setDestinationInfo(destinationMetaInfo);
+      for(Integer destTaskIndex : entry.getValue()) {
+        Task destTask = destinationVertex.getTask(destTaskIndex);
+        if (destTask == null) {
+          throw new TezUncheckedException("Unexpected null task." +
+              " sourceVertex=" + sourceVertex.getVertexId() +
+              " srcIndex = " + srcTaskIndex +
+              " destAttemptId=" + destinationVertex.getVertexId() +
+              " destIndex=" + destTaskIndex + 
+              " edgeManager=" + edgeManager.getClass().getName());
+        }
+        TezTaskID destTaskId = destTask.getTaskId();
+        sendEventToTask(destTaskId, tezEventToSend);
+      }
+    }
+  }
+  
   public void sendTezEventToDestinationTasks(TezEvent tezEvent) {
     if (!bufferEvents.get()) {
-      List<Integer> destTaskIndices = new ArrayList<Integer>();
       boolean isDataMovementEvent = true;
       switch (tezEvent.getEventType()) {
+      case COMPOSITE_DATA_MOVEMENT_EVENT:
+        handleCompositeDataMovementEvent(tezEvent);
+        break;
       case INPUT_FAILED_EVENT:
         isDataMovementEvent = false;
+        // fall through
       case DATA_MOVEMENT_EVENT:
-        Event event = tezEvent.getEvent();
-        TezTaskAttemptID sourceAttemptId = tezEvent.getSourceInfo().getTaskAttemptID();
-        int sourceTaskIndex = sourceAttemptId.getTaskID().getId();
+        Map<Integer, List<Integer>> inputIndicesToTaskIndices = Maps
+        .newHashMap();
+        TezTaskAttemptID srcAttemptId = tezEvent.getSourceInfo()
+            .getTaskAttemptID();
+        int srcTaskIndex = srcAttemptId.getTaskID().getId();
         if (isDataMovementEvent) {
-          edgeManager.routeEventToDestinationTasks((DataMovementEvent) event,
-              sourceTaskIndex, destinationVertex.getTotalTasks(),
-              destTaskIndices);
+          DataMovementEvent dmEvent = (DataMovementEvent)tezEvent.getEvent();
+          edgeManager.routeDataMovementEventToDestination(dmEvent,
+                srcTaskIndex, destinationVertex.getTotalTasks(),
+                inputIndicesToTaskIndices);
         } else {
-          edgeManager.routeEventToDestinationTasks((InputFailedEvent) event,
-              sourceTaskIndex, destinationVertex.getTotalTasks(),
-              destTaskIndices);
+          edgeManager.routeInputSourceTaskFailedEventToDestination(srcTaskIndex,
+              destinationVertex.getTotalTasks(), inputIndicesToTaskIndices);
         }
-        for(Integer destTaskIndex : destTaskIndices) {
-          EventMetaData destMeta = new EventMetaData(EventProducerConsumerType.INPUT, 
-              destinationVertex.getName(), 
-              sourceVertex.getName(), 
-              null); // will be filled by Task when sending the event. Is it needed?
-          if (isDataMovementEvent) {
-            destMeta.setIndex(((DataMovementEvent)event).getTargetIndex());
-          } else {
-            destMeta.setIndex(((InputFailedEvent)event).getTargetIndex());
-          }
-          tezEvent.setDestinationInfo(destMeta);
-          Task destTask = destinationVertex.getTask(destTaskIndex);
-          if (destTask == null) {
-            throw new TezUncheckedException("Unexpected null task." +
-                " sourceVertex=" + sourceVertex.getVertexId() +
-                " srcIndex = " + sourceTaskIndex +
-                " destAttemptId=" + destinationVertex.getVertexId() +
-                " destIndex=" + destTaskIndex + 
-                " edgeManager=" + edgeManager.getClass().getName());
-          }
-          TezTaskID destTaskId = destTask.getTaskId();
-          sendEventToTask(destTaskId, tezEvent);
-        }        
+        if (!inputIndicesToTaskIndices.isEmpty()) {
+          sendDmEventOrIfEventToTasks(tezEvent, srcTaskIndex, isDataMovementEvent, inputIndicesToTaskIndices);
+        } else {
+          throw new TezUncheckedException("Event must be routed." +
+              " sourceVertex=" + sourceVertex.getVertexId() +
+              " srcIndex = " + srcTaskIndex +
+              " destAttemptId=" + destinationVertex.getVertexId() +
+              " edgeManager=" + edgeManager.getClass().getName() + 
+              " Event type=" + tezEvent.getEventType());
+        }
         break;
       default:
         throw new TezUncheckedException("Unhandled tez event type: "
@@ -232,5 +349,13 @@ public class Edge {
   private void sendEventToTask(TezTaskID taskId, TezEvent tezEvent) {
     eventHandler.handle(new TaskEventAddTezEvent(taskId, tezEvent));
   }
-  
+
+  public String getSourceVertexName() {
+    return this.sourceVertex.getName();
+  }
+
+  public String getDestinationVertexName() {
+    return this.destinationVertex.getName();
+  }
+
 }

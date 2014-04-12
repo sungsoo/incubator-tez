@@ -27,6 +27,10 @@ import java.util.List;
  * <code>Output</code> implementations must have a 0 argument public constructor
  * for Tez to construct the <code>Output</code>. Tez will take care of
  * initializing and closing the Input after a {@link Processor} completes. </p>
+ *
+ * During initialization, Outputs must specify an initial memory requirement via
+ * {@link TezOutputContext}.requestInitialMemory
+ * 
  */
 public interface Output {
 
@@ -35,7 +39,7 @@ public interface Output {
    *
    * @param outputContext
    *          the {@link TezOutputContext}
-   * @return
+   * @return list of events that were generated during initialization
    * @throws Exception
    *           if an error occurs
    */
@@ -43,16 +47,33 @@ public interface Output {
       throws Exception;
 
   /**
+   * Start any processing that the Output may need to perform. It is the
+   * responsibility of the Processor to start Outputs.
+   * 
+   * This typically acts as a signal to Outputs to start any Processing that they
+   * may required.
+   * 
+   * This method may be invoked by the framework under certain circumstances,
+   * and as such requires the implementation to be non-blocking.   
+   * 
+   * Outputs must be written to handle multiple start invocations - typically
+   * honoring only the first one.
+   * 
+   * @throws Exception
+   */
+  public void start() throws Exception;
+
+  /**
    * Gets an instance of the {@link Writer} in an <code>Output</code>
    *
-   * @return
+   * @return Gets an instance of the {@link Writer} in an <code>Output</code>
    * @throws Exception
    *           if an error occurs
    */
   public Writer getWriter() throws Exception;
 
   /**
-   * Handles user and system generated {@link Events}s, which typically carry
+   * Handles user and system generated {@link Event}s, which typically carry
    * information such as a downstream vertex being ready to consume input.
    *
    * @param outputEvents
@@ -63,7 +84,7 @@ public interface Output {
   /**
    * Closes the <code>Output</code>
    *
-   * @return
+   * @return list of events that were generated during close
    * @throws Exception
    *           if an error occurs
    */

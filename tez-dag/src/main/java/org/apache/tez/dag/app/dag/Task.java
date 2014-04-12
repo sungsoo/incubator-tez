@@ -24,6 +24,7 @@ import java.util.Map;
 import org.apache.tez.common.counters.TezCounters;
 import org.apache.tez.dag.api.oldrecords.TaskReport;
 import org.apache.tez.dag.api.oldrecords.TaskState;
+import org.apache.tez.dag.history.HistoryEvent;
 import org.apache.tez.dag.records.TezTaskAttemptID;
 import org.apache.tez.dag.records.TezTaskID;
 import org.apache.tez.runtime.api.impl.TezEvent;
@@ -68,7 +69,8 @@ public interface Task {
    * Get the attempt id which has reported in as output ready. null if not
    * applicable.
    * 
-   * @return
+   * @return the attempt id which has reported in as output ready. null if not
+   * applicable.
    */
   TezTaskAttemptID getOutputConsumableAttempt();
   
@@ -77,8 +79,7 @@ public interface Task {
   public List<TezEvent> getTaskAttemptTezEvents(TezTaskAttemptID attemptID,
       int fromEventId, int maxEvents);
   
-  public List<TezEvent> getAndClearTaskTezEvents();
-
   public List<String> getDiagnostics();
 
+  TaskState restoreFromEvent(HistoryEvent historyEvent);
 }

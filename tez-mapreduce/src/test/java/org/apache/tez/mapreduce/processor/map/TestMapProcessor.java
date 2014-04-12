@@ -101,6 +101,7 @@ public class TestMapProcessor {
   
   @Test
   public void testMapProcessor() throws Exception {
+    String dagName = "mrdag0";
     String vertexName = MultiStageMRConfigUtil.getInitialMapVertexName();
     JobConf jobConf = new JobConf(defaultConf);
     setUpJobConf(jobConf);
@@ -129,7 +130,7 @@ public class TestMapProcessor {
     OutputSpec mapOutputSpec = new OutputSpec("NullDestVertex", new OutputDescriptor(LocalOnFileSorterOutput.class.getName()), 1);
 
     LogicalIOProcessorRuntimeTask task = MapUtils.createLogicalTask(localFs, workDir, job, 0,
-        new Path(workDir, "map0"), new TestUmbilical(), vertexName,
+        new Path(workDir, "map0"), new TestUmbilical(), dagName, vertexName,
         Collections.singletonList(mapInputSpec),
         Collections.singletonList(mapOutputSpec));
     
@@ -150,7 +151,7 @@ public class TestMapProcessor {
     Path mapOutputFile = mapOutputs.getInputFile(new InputAttemptIdentifier(0, 0));
     LOG.info("mapOutputFile = " + mapOutputFile);
     IFile.Reader reader =
-        new IFile.Reader(localFs, mapOutputFile, null, null, false, 0, -1);
+        new IFile.Reader(localFs, mapOutputFile, null, null, null, false, 0, -1);
     LongWritable key = new LongWritable();
     Text value = new Text();
     DataInputBuffer keyBuf = new DataInputBuffer();

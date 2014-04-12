@@ -24,21 +24,15 @@ import java.util.Set;
 
 public class VertexLocationHint  {
 
-  private final int numTasks;
   private final List<TaskLocationHint> taskLocationHints;
 
-  public VertexLocationHint(int numTasks,
-      List<TaskLocationHint> taskLocationHints) {
-    this.numTasks = numTasks;
+  
+  public VertexLocationHint(List<TaskLocationHint> taskLocationHints) {
     if (taskLocationHints != null) {
       this.taskLocationHints = Collections.unmodifiableList(taskLocationHints);
     } else {
       this.taskLocationHints = null;
     }
-  }
-
-  public int getNumTasks() {
-    return numTasks;
   }
 
   public List<TaskLocationHint> getTaskLocationHints() {
@@ -49,7 +43,6 @@ public class VertexLocationHint  {
   public int hashCode() {
     final int prime = 7883;
     int result = 1;
-    result = prime * result + numTasks;
     if (taskLocationHints != null) {
       result = prime * result + taskLocationHints.hashCode();
     }
@@ -68,9 +61,6 @@ public class VertexLocationHint  {
       return false;
     }
     VertexLocationHint other = (VertexLocationHint) obj;
-    if (numTasks != other.numTasks) {
-      return false;
-    }
     if (taskLocationHints != null) {
       if (!taskLocationHints.equals(other.taskLocationHints)) {
         return false;

@@ -19,7 +19,11 @@ package org.apache.tez.runtime.library.input;
 
 import java.io.IOException;
 import java.util.Collections;
+import java.util.LinkedList;
 import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -34,9 +38,13 @@ import org.apache.tez.runtime.api.LogicalInput;
 import org.apache.tez.runtime.api.TezInputContext;
 import org.apache.tez.runtime.library.api.KeyValuesReader;
 import org.apache.tez.runtime.library.common.ConfigUtils;
+import org.apache.tez.runtime.library.common.MemoryUpdateCallbackHandler;
 import org.apache.tez.runtime.library.common.ValuesIterator;
 import org.apache.tez.runtime.library.common.shuffle.impl.Shuffle;
 import org.apache.tez.runtime.library.common.sort.impl.TezRawKeyValueIterator;
+
+import com.google.common.base.Preconditions;
+
 
 /**
  * <code>ShuffleMergedInput</code> in a {@link LogicalInput} which shuffles
@@ -58,31 +66,63 @@ public class ShuffledMergedInput implements LogicalInput {
   protected Configuration conf;
   protected int numInputs = 0;
   protected Shuffle shuffle;
+  protected MemoryUpdateCallbackHandler memoryUpdateCallbackHandler;
+  private final BlockingQueue<Event> pendingEvents = new LinkedBlockingQueue<Event>();
+  private long firstEventReceivedTime = -1;
   @SuppressWarnings("rawtypes")
   protected ValuesIterator vIter;
 
   private TezCounter inputKeyCounter;
   private TezCounter inputValueCounter;
+  
+  private final AtomicBoolean isStarted = new AtomicBoolean(false);
 
   @Override
-  public List<Event> initialize(TezInputContext inputContext) throws IOException {
+  public synchronized List<Event> initialize(TezInputContext inputContext) throws IOException {
     this.inputContext = inputContext;
     this.conf = TezUtils.createConfFromUserPayload(inputContext.getUserPayload());
 
     if (this.numInputs == 0) {
+      inputContext.requestInitialMemory(0l, null);
+      isStarted.set(true);
+      inputContext.inputIsReady();
+      LOG.info("input fetch not required since there are 0 physical inputs for input vertex: "
+          + inputContext.getSourceVertexName());
       return Collections.emptyList();
     }
+    
+    long initialMemoryRequest = Shuffle.getInitialMemoryRequirement(conf,
+        inputContext.getTotalMemoryAvailableToTask());
+    this.memoryUpdateCallbackHandler = new MemoryUpdateCallbackHandler();
+    inputContext.requestInitialMemory(initialMemoryRequest, memoryUpdateCallbackHandler);
 
     this.inputKeyCounter = inputContext.getCounters().findCounter(TaskCounter.REDUCE_INPUT_GROUPS);
-    this.inputValueCounter = inputContext.getCounters().findCounter(TaskCounter.REDUCE_INPUT_RECORDS);
-    this.conf.setStrings(TezJobConfig.LOCAL_DIRS,
-        inputContext.getWorkDirs());
-
-    // Start the shuffle - copy and merge.
-    shuffle = new Shuffle(inputContext, this.conf, numInputs);
-    shuffle.run();
+    this.inputValueCounter = inputContext.getCounters().findCounter(
+        TaskCounter.REDUCE_INPUT_RECORDS);
+    this.conf.setStrings(TezJobConfig.LOCAL_DIRS, inputContext.getWorkDirs());
 
     return Collections.emptyList();
+  }
+  
+  @Override
+  public synchronized void start() throws IOException {
+    if (!isStarted.get()) {
+      memoryUpdateCallbackHandler.validateUpdateReceived();
+      // Start the shuffle - copy and merge
+      shuffle = new Shuffle(inputContext, conf, numInputs, memoryUpdateCallbackHandler.getMemoryAssigned());
+      shuffle.run();
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Initialized the handlers in shuffle..Safe to start processing..");
+      }
+      List<Event> pending = new LinkedList<Event>();
+      pendingEvents.drainTo(pending);
+      if (pending.size() > 0) {
+        LOG.info("NoAutoStart delay in processing first event: "
+            + (System.currentTimeMillis() - firstEventReceivedTime));
+        shuffle.handleEvents(pending);
+      }
+      isStarted.set(true);
+    }
   }
 
   /**
@@ -92,7 +132,8 @@ public class ShuffledMergedInput implements LogicalInput {
    *         processing fetching the input. false if the shuffle and merge are
    *         still in progress
    */
-  public boolean isInputReady() {
+  public synchronized boolean isInputReady() {
+    Preconditions.checkState(isStarted.get(), "Must start input before invoking this method");
     if (this.numInputs == 0) {
       return true;
     }
@@ -105,16 +146,26 @@ public class ShuffledMergedInput implements LogicalInput {
    * @throws InterruptedException
    */
   public void waitForInputReady() throws IOException, InterruptedException {
-    if (this.numInputs == 0) {
-      return;
+    // Cannot synchronize entire method since this is called form user code and can block.
+    Shuffle localShuffleCopy = null;
+    synchronized (this) {
+      Preconditions.checkState(isStarted.get(), "Must start input before invoking this method");
+      if (this.numInputs == 0) {
+        return;
+      }
+      localShuffleCopy = shuffle;
     }
-    rawIter = shuffle.waitForInput();
-    createValuesIterator();
+    
+    TezRawKeyValueIterator localRawIter = localShuffleCopy.waitForInput();
+    synchronized(this) {
+      rawIter = localRawIter;
+      createValuesIterator();
+    }
   }
 
   @Override
-  public List<Event> close() throws IOException {
-    if (this.numInputs != 0) {
+  public synchronized List<Event> close() throws IOException {
+    if (this.numInputs != 0 && rawIter != null) {
       rawIter.close();
     }
     return Collections.emptyList();
@@ -134,25 +185,30 @@ public class ShuffledMergedInput implements LogicalInput {
    */
   @Override
   public KeyValuesReader getReader() throws IOException {
-    if (this.numInputs == 0) {
-      return new KeyValuesReader() {
-        @Override
-        public boolean next() throws IOException {
-          return false;
-        }
+    // Cannot synchronize entire method since this is called form user code and can block.
+    TezRawKeyValueIterator rawIterLocal;
+    synchronized (this) {
+      rawIterLocal = rawIter;
+      if (this.numInputs == 0) {
+        return new KeyValuesReader() {
+          @Override
+          public boolean next() throws IOException {
+            return false;
+          }
 
-        @Override
-        public Object getCurrentKey() throws IOException {
-          throw new RuntimeException("No data available in Input");
-        }
+          @Override
+          public Object getCurrentKey() throws IOException {
+            throw new RuntimeException("No data available in Input");
+          }
 
-        @Override
-        public Iterable<Object> getCurrentValues() throws IOException {
-          throw new RuntimeException("No data available in Input");
-        }
-      };
+          @Override
+          public Iterable<Object> getCurrentValues() throws IOException {
+            throw new RuntimeException("No data available in Input");
+          }
+        };
+      }
     }
-    if (rawIter == null) {
+    if (rawIterLocal == null) {
       try {
         waitForInputReady();
       } catch (InterruptedException e) {
@@ -160,40 +216,40 @@ public class ShuffledMergedInput implements LogicalInput {
         throw new IOException("Interrupted while waiting for input ready", e);
       }
     }
-    return new KeyValuesReader() {
-
-      @Override
-      public boolean next() throws IOException {
-        return vIter.moveToNext();
-      }
-
-      public Object getCurrentKey() throws IOException {
-        return vIter.getKey();
-      }
-      
-      @SuppressWarnings("unchecked")
-      public Iterable<Object> getCurrentValues() throws IOException {
-        return vIter.getValues();
-      }
-    };
+    @SuppressWarnings("rawtypes")
+    ValuesIterator valuesIter = null;
+    synchronized(this) {
+      valuesIter = vIter;
+    }
+    return new ShuffledMergedKeyValuesReader(valuesIter);
   }
 
   @Override
   public void handleEvents(List<Event> inputEvents) {
-    if (numInputs == 0) {
-      throw new RuntimeException("No input events expected as numInputs is 0");
+    synchronized (this) {
+      if (numInputs == 0) {
+        throw new RuntimeException("No input events expected as numInputs is 0");
+      }
+      if (!isStarted.get()) {
+        if (firstEventReceivedTime == -1) {
+          firstEventReceivedTime = System.currentTimeMillis();
+        }
+        pendingEvents.addAll(inputEvents);
+        return;
+      }
     }
     shuffle.handleEvents(inputEvents);
   }
 
   @Override
-  public void setNumPhysicalInputs(int numInputs) {
+  public synchronized void setNumPhysicalInputs(int numInputs) {
     this.numInputs = numInputs;
   }
 
   @SuppressWarnings({ "rawtypes", "unchecked" })
-  protected void createValuesIterator()
+  protected synchronized void createValuesIterator()
       throws IOException {
+    // Not used by ReduceProcessor
     vIter = new ValuesIterator(rawIter,
         (RawComparator) ConfigUtils.getIntermediateInputKeyComparator(conf),
         ConfigUtils.getIntermediateInputKeyClass(conf),
@@ -201,15 +257,27 @@ public class ShuffledMergedInput implements LogicalInput {
 
   }
 
-  // This functionality is currently broken. If there's inputs which need to be
-  // written to disk, there's a possibility that inputs from the different
-  // sources could clobber each others' output. Also the current structures do
-  // not have adequate information to de-dupe these (vertex name)
-//  public void mergeWith(ShuffledMergedInput other) {
-//    this.numInputs += other.getNumPhysicalInputs();
-//  }
-//
-//  public int getNumPhysicalInputs() {
-//    return this.numInputs;
-//  }
+  @SuppressWarnings("rawtypes")
+  private static class ShuffledMergedKeyValuesReader implements KeyValuesReader {
+
+    private final ValuesIterator valuesIter;
+
+    ShuffledMergedKeyValuesReader(ValuesIterator valuesIter) {
+      this.valuesIter = valuesIter;
+    }
+
+    @Override
+    public boolean next() throws IOException {
+      return valuesIter.moveToNext();
+    }
+
+    public Object getCurrentKey() throws IOException {
+      return valuesIter.getKey();
+    }
+
+    @SuppressWarnings("unchecked")
+    public Iterable<Object> getCurrentValues() throws IOException {
+      return valuesIter.getValues();
+    }
+  };
 }

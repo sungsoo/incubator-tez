@@ -19,76 +19,110 @@
 package org.apache.tez.dag.api;
 
 import java.util.List;
+import java.util.Map;
 
+import org.apache.hadoop.classification.InterfaceStability.Evolving;
 import org.apache.tez.runtime.api.events.DataMovementEvent;
-import org.apache.tez.runtime.api.events.InputFailedEvent;
 import org.apache.tez.runtime.api.events.InputReadErrorEvent;
 
 /**
  * This interface defines the routing of the event between tasks of producer and 
  * consumer vertices. The routing is bi-directional. Users can customize the 
  * routing by providing an implementation of this interface.
+ * 
+ * Implementations must provide a 0 argument public constructor.
  */
+@Evolving
 public interface EdgeManager {
   
   /**
-   * Get the number of inputs on the destination task
+   * Initializes the EdgeManager. This method is called in the following
+   * circumstances </p> 1. when initializing an Edge Manager for the first time.
+   * </p> 2. When an EdgeManager is replaced at runtime. At this point, an
+   * EdgeManager instance is created and setup by the user. The initialize
+   * method will be called with the original {@link EdgeManagerContext} when the
+   * edgeManager is replaced.
+   * 
+   * @param edgeManagerContext
+   *          the context within which this EdgeManager will run. Includes
+   *          information like configuration which the user may have specified
+   *          while setting up the edge.
+   */
+  public void initialize(EdgeManagerContext edgeManagerContext);
+  
+  /**
+   * Get the number of physical inputs on the destination task
    * @param numSourceTasks Total number of source tasks
    * @param destinationTaskIndex Index of destination task for which number of 
    * inputs is needed
-   * @return Number of inputs on the destination task
+   * @return Number of physical inputs on the destination task
    */
-  public int getNumDestinationTaskInputs(int numSourceTasks, 
+  public int getNumDestinationTaskPhysicalInputs(int numSourceTasks, 
       int destinationTaskIndex);
 
   /**
-   * Get the number of outputs on the source task
+   * Get the number of physical outputs on the source task
    * @param numDestinationTasks Total number of destination tasks
    * @param sourceTaskIndex Index of the source task for which number of outputs 
    * is needed
-   * @return Number of outputs on the source task
+   * @return Number of physical outputs on the source task
    */
-  public int getNumSourceTaskOutputs(int numDestinationTasks, 
+  public int getNumSourceTaskPhysicalOutputs(int numDestinationTasks, 
       int sourceTaskIndex);
   
   /**
-   * Return the destination task indeces that need to be sent an input available 
-   * event because the source task output is now available
-   * @param event Data movement event
-   * @param sourceTaskIndex Source task
-   * @param numDestinationTasks Total number of destination tasks
-   * @param taskIndices List into which the destination task indices is to be 
-   * returned
+   * Return the routing information to inform consumers about the source task
+   * output that is now available. The return Map has the routing information.
+   * Key is the destination task physical input index and the value is the list
+   * of destination task indices for which the key input index will receive the
+   * data movement event.
+   * @param event
+   *          Data movement event
+   * @param sourceTaskIndex
+   *          Source task
+   * @param numDestinationTasks
+   *          Total number of destination tasks
+   * @param inputIndicesToTaskIndices
+   *          Map via which the routing information is returned
    */
-  public void routeEventToDestinationTasks(DataMovementEvent event,
-      int sourceTaskIndex, int numDestinationTasks, List<Integer> taskIndices);
+  public void routeDataMovementEventToDestination(DataMovementEvent event,
+      int sourceTaskIndex, int numDestinationTasks,
+      Map<Integer, List<Integer>> inputIndicesToTaskIndices);
   
   /**
-   * Return the destination task indeces that need to be sent an input failed 
-   * event because the source task output is no longer available
-   * @param event Input failed event
-   * @param sourceTaskIndex Failed source task
-   * @param numDestinationTasks Total number of destination tasks
-   * @param taskIndices List into which the destination task indices is to be 
-   * returned
+   * Return the routing information to inform consumers about the failure of a
+   * source task whose outputs have been potentially lost. The return Map has
+   * the routing information. Key is the destination task physical input index
+   * and the value is the list of destination task indices for which the key
+   * input index will receive the input failure notification. This method will
+   * be called once for every source task failure and information for all
+   * affected destinations must be provided in that invocation.
+   * 
+   * @param sourceTaskIndex
+   *          Source task
+   * @param numDestinationTasks
+   *          Total number of destination tasks
+   * @param inputIndicesToTaskIndices
+   *          Map via which the routing information is returned
    */
-  public void routeEventToDestinationTasks(InputFailedEvent event,
-      int sourceTaskIndex, int numDestinationTasks, List<Integer> taskIndices);
+  public void routeInputSourceTaskFailedEventToDestination(int sourceTaskIndex,
+      int numDestinationTasks,
+      Map<Integer, List<Integer>> inputIndicesToTaskIndices);
 
   /**
    * Get the number of destination tasks that consume data from the source task
-   * @sourceTaskIndex Source task index
-   * @numDestinationTasks Total number of destination tasks
+   * @param sourceTaskIndex Source task index
+   * @param numDestinationTasks Total number of destination tasks
    */
-  public int getDestinationConsumerTaskNumber(int sourceTaskIndex, int numDestinationTasks);
+  public int getNumDestinationConsumerTasks(int sourceTaskIndex, int numDestinationTasks);
   
   /**
    * Return the source task index to which to send the input error event
-   * @param destinationTaskIndex Destination task that reported the error
    * @param event Input read error event. Has more information about the error
+   * @param destinationTaskIndex Destination task that reported the error
    * @return Index of the source task that created the unavailable input
    */
-  public int routeEventToSourceTasks(int destinationTaskIndex,
-      InputReadErrorEvent event);
+  public int routeInputErrorEventToSource(InputReadErrorEvent event,
+      int destinationTaskIndex);
   
 }

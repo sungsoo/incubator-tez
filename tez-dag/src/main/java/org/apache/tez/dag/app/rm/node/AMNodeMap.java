@@ -53,8 +53,6 @@ public class AMNodeMap extends AbstractService implements
   private int blacklistDisablePercent;
   
   
-  // TODO XXX Ensure there's a test for IgnoreBlacklisting in
-  // TestRMContainerAllocator. Otherwise add one.
   @SuppressWarnings("rawtypes")
   public AMNodeMap(EventHandler eventHandler, AppContext appContext) {
     super("AMNodeMap");
@@ -88,8 +86,10 @@ public class AMNodeMap extends AbstractService implements
   }
   
   public void nodeSeen(NodeId nodeId) {
-    nodeMap.putIfAbsent(nodeId, new AMNodeImpl(nodeId, maxTaskFailuresPerNode,
-        eventHandler, nodeBlacklistingEnabled, appContext));
+    if (nodeMap.putIfAbsent(nodeId, new AMNodeImpl(nodeId, maxTaskFailuresPerNode,
+        eventHandler, nodeBlacklistingEnabled, appContext)) == null) {
+      LOG.info("Adding new node: " + nodeId);
+    }
   }
 
   // Interface for the scheduler to check about a specific host.
@@ -132,13 +132,15 @@ public class AMNodeMap extends AbstractService implements
     NodeId nodeId = rEvent.getNodeId();
     switch (rEvent.getType()) {
     case N_NODE_WAS_BLACKLISTED:
-   // When moving away from IGNORE_BLACKLISTING state, nodes will send out blacklisted events. These need to be ignored.
+      // When moving away from IGNORE_BLACKLISTING state, nodes will send out
+      // blacklisted events. These need to be ignored.
       addToBlackList(nodeId);
       computeIgnoreBlacklisting();
       break;
     case N_NODE_COUNT_UPDATED:
       AMNodeEventNodeCountUpdated event = (AMNodeEventNodeCountUpdated) rEvent;
       numClusterNodes = event.getNodeCount();
+      LOG.info("Num cluster nodes = " + numClusterNodes);
       computeIgnoreBlacklisting();
       break;
     case N_TURNED_UNHEALTHY:

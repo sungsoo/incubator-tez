@@ -26,7 +26,7 @@ public class InputDescriptor extends TezEntityDescriptor {
   public InputDescriptor() {
     super();
   }
-  
+
   public InputDescriptor(String inputClassName) {
     super(inputClassName);
   }

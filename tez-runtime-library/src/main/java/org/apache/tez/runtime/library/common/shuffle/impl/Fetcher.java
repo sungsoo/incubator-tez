@@ -17,6 +17,7 @@
  */
 package org.apache.tez.runtime.library.common.shuffle.impl;
 
+import java.io.BufferedInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -43,6 +44,7 @@ import org.apache.hadoop.io.compress.CompressionCodec;
 import org.apache.hadoop.io.compress.Decompressor;
 import org.apache.hadoop.security.ssl.SSLFactory;
 import org.apache.tez.common.TezJobConfig;
+import org.apache.tez.common.TezUtils;
 import org.apache.tez.common.counters.TezCounter;
 import org.apache.tez.runtime.api.TezInputContext;
 import org.apache.tez.runtime.library.common.InputAttemptIdentifier;
@@ -75,9 +77,11 @@ class Fetcher extends Thread {
   private final Shuffle shuffle;
   private final int id;
   private static int nextId = 0;
+  private int currentPartition = -1;
   
   private final int connectionTimeout;
   private final int readTimeout;
+  private final int bufferSize;
   
   // Decompression of map-outputs
   private final CompressionCodec codec;
@@ -85,8 +89,6 @@ class Fetcher extends Thread {
   private final SecretKey jobTokenSecret;
 
   private volatile boolean stopped = false;
-
-  private Configuration job;
   
   private final boolean ifileReadAhead;
   private final int ifileReadAheadLength;
@@ -100,7 +102,6 @@ class Fetcher extends Thread {
       ShuffleScheduler scheduler, MergeManager merger,
       ShuffleClientMetrics metrics,
       Shuffle shuffle, SecretKey jobTokenSecret, boolean ifileReadAhead, int ifileReadAheadLength, CompressionCodec codec, TezInputContext inputContext) throws IOException {
-    this.job = job;
     this.scheduler = scheduler;
     this.merger = merger;
     this.metrics = metrics;
@@ -137,8 +138,11 @@ class Fetcher extends Thread {
     this.readTimeout = 
         job.getInt(TezJobConfig.TEZ_RUNTIME_SHUFFLE_READ_TIMEOUT, 
             TezJobConfig.DEFAULT_TEZ_RUNTIME_SHUFFLE_READ_TIMEOUT);
+    
+    this.bufferSize = job.getInt(TezJobConfig.TEZ_RUNTIME_SHUFFLE_BUFFER_SIZE, 
+            TezJobConfig.DEFAULT_TEZ_RUNTIME_SHUFFLE_BUFFER_SIZE);
 
-    setName("fetcher#" + id);
+    setName("fetcher [" + TezUtils.cleanVertexName(inputContext.getSourceVertexName()) + "] #" + id);
     setDaemon(true);
 
     synchronized (Fetcher.class) {
@@ -223,6 +227,7 @@ class Fetcher extends Thread {
   protected void copyFromHost(MapHost host) throws IOException {
     // Get completed maps on 'host'
     List<InputAttemptIdentifier> srcAttempts = scheduler.getMapsForHost(host);
+    currentPartition = host.getPartitionId();
     
     // Sanity check to catch hosts with only 'OBSOLETE' maps, 
     // especially at the tail of large jobs
@@ -232,7 +237,7 @@ class Fetcher extends Thread {
     
     if(LOG.isDebugEnabled()) {
       LOG.debug("Fetcher " + id + " going to fetch from " + host + " for: "
-        + srcAttempts);
+        + srcAttempts + ", partitionId: " + currentPartition);
     }
     
     // List of maps to be fetched yet
@@ -262,7 +267,7 @@ class Fetcher extends Thread {
           ShuffleHeader.DEFAULT_HTTP_HEADER_VERSION);
       connect(connection, connectionTimeout);
       connectSucceeded = true;
-      input = new DataInputStream(connection.getInputStream());
+      input = new DataInputStream(new BufferedInputStream(connection.getInputStream(), bufferSize));
 
       // Validate response code
       int rc = connection.getResponseCode();
@@ -289,29 +294,29 @@ class Fetcher extends Thread {
       LOG.info("for url="+msgToEncode+" sent hash and receievd reply");
     } catch (IOException ie) {
       ioErrs.increment(1);
-      LOG.warn("Failed to connect to " + host + " with " + remaining.size() + 
-               " map outputs", ie);
-
-      // If connect did not succeed, just mark all the maps as failed,
-      // indirectly penalizing the host
       if (!connectSucceeded) {
-        for(InputAttemptIdentifier left: remaining) {
-          scheduler.copyFailed(left, host, connectSucceeded);
-        }
+        LOG.warn("Failed to connect to " + host + " with " + remaining.size() + " inputs", ie);
+        connectionErrs.increment(1);
       } else {
-        // If we got a read error at this stage, it implies there was a problem
-        // with the first map, typically lost map. So, penalize only that map
-        // and add the rest
-        InputAttemptIdentifier firstMap = srcAttempts.get(0);
-        scheduler.copyFailed(firstMap, host, connectSucceeded);
+        LOG.warn("Failed to verify reply after connecting to " + host + " with " + remaining.size()
+          + " inputs pending", ie);
       }
+
+      // At this point, either the connection failed, or the initial header verification failed.
+      // The error does not relate to any specific Input. Report all of them as failed.
       
-      // Add back all the remaining maps, WITHOUT marking them as failed
+      // This ends up indirectly penalizing the host (multiple failures reported on the single host)
+
       for(InputAttemptIdentifier left: remaining) {
-        // TODO Should the first one be skipped ?
-        scheduler.putBackKnownMapOutput(host, left);
+        // Need to be handling temporary glitches .. 
+        // Report read error to the AM to trigger source failure heuristics
+        scheduler.copyFailed(left, host, connectSucceeded, !connectSucceeded);
       }
-      
+
+      // Add back all remaining maps - which at this point is ALL MAPS the
+      // Fetcher was started with. The Scheduler takes care of retries,
+      // reporting too many failures etc.
+      putBackRemainingMapOutputs(host);
       return;
     }
     
@@ -322,13 +327,16 @@ class Fetcher extends Thread {
       // yet_to_be_fetched list and marking the failed tasks.
       InputAttemptIdentifier[] failedTasks = null;
       while (!remaining.isEmpty() && failedTasks == null) {
+        // fail immediately after first failure because we dont know how much to 
+        // skip for this error in the input stream. So we cannot move on to the 
+        // remaining outputs. YARN-1773. Will get to them in the next retry.
         failedTasks = copyMapOutput(host, input);
       }
       
       if(failedTasks != null && failedTasks.length > 0) {
         LOG.warn("copyMapOutput failed for tasks "+Arrays.toString(failedTasks));
         for(InputAttemptIdentifier left: failedTasks) {
-          scheduler.copyFailed(left, host, true);
+          scheduler.copyFailed(left, host, true, false);
         }
       }
       
@@ -340,12 +348,27 @@ class Fetcher extends Thread {
             + remaining.size() + " left.");
       }
     } finally {
-      for (InputAttemptIdentifier left : remaining) {
-        scheduler.putBackKnownMapOutput(host, left);
-      }
+      putBackRemainingMapOutputs(host);
     }
   }
   
+  private void putBackRemainingMapOutputs(MapHost host) {
+    // Cycle through remaining MapOutputs
+    boolean isFirst = true;
+    InputAttemptIdentifier first = null;
+    for (InputAttemptIdentifier left : remaining) {
+      if (isFirst) {
+        first = left;
+        isFirst = false;
+        continue;
+      }
+      scheduler.putBackKnownMapOutput(host, left);
+    }
+    if (first != null) { // Empty remaining list.
+      scheduler.putBackKnownMapOutput(host, first);
+    }
+  }
+
   private static InputAttemptIdentifier[] EMPTY_ATTEMPT_ID_ARRAY = new InputAttemptIdentifier[0];
   
   private InputAttemptIdentifier[] copyMapOutput(MapHost host,
@@ -361,7 +384,12 @@ class Fetcher extends Thread {
       //Read the shuffle header
       try {
         ShuffleHeader header = new ShuffleHeader();
+        // TODO Review: Multiple header reads in case of status WAIT ? 
         header.readFields(input);
+        if (!header.mapId.startsWith(InputAttemptIdentifier.PATH_PREFIX)) {
+          throw new IllegalArgumentException(
+              "Invalid header received: " + header.mapId + " partition: " + header.forReduce);
+        }
         srcAttemptId = 
             scheduler.getIdentifierForFetchedOutput(header.mapId, header.forReduce);
         compressedLength = header.compressedLength;
@@ -370,8 +398,9 @@ class Fetcher extends Thread {
       } catch (IllegalArgumentException e) {
         badIdErrs.increment(1);
         LOG.warn("Invalid map id ", e);
-        //Don't know which one was bad, so consider all of them as bad
-        return remaining.toArray(new InputAttemptIdentifier[remaining.size()]);
+        // Don't know which one was bad, so consider this one bad and dont read
+        // the remaining because we dont know where to start reading from. YARN-1773
+        return new InputAttemptIdentifier[] {getNextRemainingAttempt()};
       }
 
  
@@ -392,10 +421,18 @@ class Fetcher extends Thread {
       }
       
       // Get the location for the map output - either in-memory or on-disk
-      mapOutput = merger.reserve(srcAttemptId, decompressedLength, id);
+      try {
+        mapOutput = merger.reserve(srcAttemptId, decompressedLength, id);
+      } catch (IOException e) {
+        // Kill the reduce attempt
+        ioErrs.increment(1);
+        scheduler.reportLocalError(e);
+        return EMPTY_ATTEMPT_ID_ARRAY;
+      }
       
       // Check if we can shuffle *now* ...
       if (mapOutput.getType() == Type.WAIT) {
+        // TODO Review: Does this cause a tight loop ?
         LOG.info("fetcher#" + id + " - MergerManager returned Status.WAIT ...");
         //Not an error but wait to process data.
         return EMPTY_ATTEMPT_ID_ARRAY;
@@ -415,7 +452,7 @@ class Fetcher extends Thread {
       
       // Inform the shuffle scheduler
       long endTime = System.currentTimeMillis();
-      scheduler.copySucceeded(srcAttemptId, host, compressedLength, 
+      scheduler.copySucceeded(srcAttemptId, host, compressedLength, decompressedLength, 
                               endTime - startTime, mapOutput);
       // Note successful shuffle
       remaining.remove(srcAttemptId);
@@ -435,7 +472,7 @@ class Fetcher extends Thread {
       }
       
       LOG.warn("Failed to shuffle output of " + srcAttemptId + 
-               " from " + host.getHostName(), ioe); 
+               " from " + host.getHostIdentifier(), ioe); 
 
       // Inform the shuffle-scheduler
       mapOutput.abort();
@@ -463,14 +500,16 @@ class Fetcher extends Thread {
                decompressedLength);
       return false;
     }
-    
-//    if (forReduce < reduceStartId || forReduce >= reduceStartId+reduceRange) {
-//      wrongReduceErrs.increment(1);
-//      LOG.warn(getName() + " data for the wrong reduce map: " +
-//               srcAttemptId + " len: " + compressedLength + " decomp len: " +
-//               decompressedLength + " for reduce " + forReduce);
-//      return false;
-//    }
+
+    // partitionId verification. Isn't availalbe here because it is encoded into
+    // URI
+    if (forReduce != currentPartition) {
+      wrongReduceErrs.increment(1);
+      LOG.warn(getName() + " data for the wrong partition map: " + srcAttemptId + " len: "
+          + compressedLength + " decomp len: " + decompressedLength + " for partition " + forReduce
+          + ", expected partition: " + currentPartition);
+      return false;
+    }
 
     // Sanity check
     if (!remaining.contains(srcAttemptId)) {
@@ -629,7 +668,7 @@ class Fetcher extends Thread {
     if (bytesLeft != 0) {
       throw new IOException("Incomplete map output received for " +
                             mapOutput.getAttemptIdentifier() + " from " +
-                            host.getHostName() + " (" + 
+                            host.getHostIdentifier() + " (" + 
                             bytesLeft + " bytes missing of " + 
                             compressedLength + ")"
       );

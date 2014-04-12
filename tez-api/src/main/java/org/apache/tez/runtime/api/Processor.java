@@ -18,7 +18,6 @@
 
 package org.apache.tez.runtime.api;
 
-import java.io.IOException;
 import java.util.List;
 
 /**
@@ -38,7 +37,7 @@ public interface Processor {
       throws Exception;
 
   /**
-   * Handles user and system generated {@link Events}s.
+   * Handles user and system generated {@link Event}s.
    *
    * @param processorEvents
    *          the list of {@link Event}s

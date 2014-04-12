@@ -18,28 +18,51 @@
 
 package org.apache.tez.dag.history.events;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+
 import org.apache.tez.common.counters.TezCounters;
-import org.apache.tez.dag.api.client.DAGStatus;
+import org.apache.tez.dag.api.DagTypeConverters;
+import org.apache.tez.dag.app.dag.DAGState;
 import org.apache.tez.dag.history.HistoryEvent;
-import org.apache.tez.dag.history.avro.DAGFinished;
-import org.apache.tez.dag.history.avro.HistoryEventType;
+import org.apache.tez.dag.history.HistoryEventType;
+import org.apache.tez.dag.history.SummaryEvent;
+import org.apache.tez.dag.history.ats.EntityTypes;
+import org.apache.tez.dag.history.utils.ATSConstants;
+import org.apache.tez.dag.history.utils.DAGUtils;
 import org.apache.tez.dag.records.TezDAGID;
+import org.apache.tez.dag.recovery.records.RecoveryProtos;
+import org.apache.tez.dag.recovery.records.RecoveryProtos.DAGFinishedProto;
+import org.apache.tez.dag.recovery.records.RecoveryProtos.SummaryEventProto;
+import org.codehaus.jettison.json.JSONArray;
+import org.codehaus.jettison.json.JSONException;
+import org.codehaus.jettison.json.JSONObject;
 
-public class DAGFinishedEvent implements HistoryEvent {
+import com.google.common.primitives.Ints;
+import com.google.protobuf.ByteString;
 
-  private DAGFinished datum = new DAGFinished();
-  // FIXME remove this when we have a proper history
-  private final TezCounters tezCounters;
+public class DAGFinishedEvent implements HistoryEvent, SummaryEvent {
+
+  private TezDAGID dagID;
+  private long startTime;
+  private long finishTime;
+  private DAGState state;
+  private String diagnostics;
+  private TezCounters tezCounters;
+
+  public DAGFinishedEvent() {
+  }
 
   public DAGFinishedEvent(TezDAGID dagId, long startTime,
-      long finishTime, DAGStatus.State state,
+      long finishTime, DAGState state,
       String diagnostics, TezCounters counters) {
-    datum.dagId = dagId.toString();
-    datum.startTime = startTime;
-    datum.finishTime = finishTime;
-    datum.status = state.name();
-    datum.diagnostics = diagnostics;
-    tezCounters = counters;
+    this.dagID = dagId;
+    this.startTime = startTime;
+    this.finishTime = finishTime;
+    this.state = state;
+    this.diagnostics = diagnostics;
+    this.tezCounters = counters;
   }
 
   @Override
@@ -48,26 +71,148 @@ public class DAGFinishedEvent implements HistoryEvent {
   }
 
   @Override
-  public Object getBlob() {
-    // TODO Auto-generated method stub
-    return this.toString();
+  public JSONObject convertToATSJSON() throws JSONException {
+    JSONObject jsonObject = new JSONObject();
+    jsonObject.put(ATSConstants.ENTITY,
+        dagID.toString());
+    jsonObject.put(ATSConstants.ENTITY_TYPE,
+        EntityTypes.TEZ_DAG_ID.name());
+
+    // Related Entities not needed as should have been done in
+    // dag submission event
+
+    // TODO decide whether this goes into different events,
+    // event info or other info.
+    JSONArray events = new JSONArray();
+    JSONObject finishEvent = new JSONObject();
+    finishEvent.put(ATSConstants.TIMESTAMP, finishTime);
+    finishEvent.put(ATSConstants.EVENT_TYPE,
+        HistoryEventType.DAG_FINISHED.name());
+    events.put(finishEvent);
+    jsonObject.put(ATSConstants.EVENTS, events);
+
+    JSONObject otherInfo = new JSONObject();
+    otherInfo.put(ATSConstants.START_TIME, startTime);
+    otherInfo.put(ATSConstants.FINISH_TIME, finishTime);
+    otherInfo.put(ATSConstants.TIME_TAKEN, (finishTime - startTime));
+    otherInfo.put(ATSConstants.STATUS, state.name());
+    otherInfo.put(ATSConstants.DIAGNOSTICS, diagnostics);
+    otherInfo.put(ATSConstants.COUNTERS,
+        DAGUtils.convertCountersToJSON(this.tezCounters));
+    jsonObject.put(ATSConstants.OTHER_INFO, otherInfo);
+
+    return jsonObject;
   }
 
   @Override
-  public void setBlob(Object blob) {
-    this.datum = (DAGFinished) blob;
+  public boolean isRecoveryEvent() {
+    return true;
+  }
+
+  @Override
+  public boolean isHistoryEvent() {
+    return true;
+  }
+
+  public DAGFinishedProto toProto() {
+    DAGFinishedProto.Builder builder = DAGFinishedProto.newBuilder();
+
+    builder.setDagId(dagID.toString())
+        .setState(state.ordinal())
+        .setFinishTime(finishTime);
+
+    if (diagnostics != null) {
+      builder.setDiagnostics(diagnostics);
+    }
+    if (tezCounters != null) {
+      builder.setCounters(DagTypeConverters.convertTezCountersToProto(tezCounters));
+    }
+
+    return builder.build();
+  }
+
+  public void fromProto(DAGFinishedProto proto) {
+    this.dagID = TezDAGID.fromString(proto.getDagId());
+    this.finishTime = proto.getFinishTime();
+    this.state = DAGState.values()[proto.getState()];
+    if (proto.hasDiagnostics()) {
+      this.diagnostics = proto.getDiagnostics();
+    }
+    if (proto.hasCounters()) {
+      this.tezCounters = DagTypeConverters.convertTezCountersFromProto(
+          proto.getCounters());
+    }
+  }
+
+  @Override
+  public void toProtoStream(OutputStream outputStream) throws IOException {
+    toProto().writeDelimitedTo(outputStream);
+  }
+
+  @Override
+  public void fromProtoStream(InputStream inputStream) throws IOException {
+    DAGFinishedProto proto = DAGFinishedProto.parseDelimitedFrom(inputStream);
+    fromProto(proto);
   }
 
   @Override
   public String toString() {
-    return "dagId=" + datum.dagId
-        + ", startTime=" + datum.startTime
-        + ", finishTime=" + datum.finishTime
-        + ", timeTaken=" + (datum.finishTime - datum.startTime)
-        + ", status=" + datum.status
-        + ", diagnostics=" + datum.diagnostics
-        + ", counters="
-        + tezCounters.toString()
-            .replaceAll("\\n", ", ").replaceAll("\\s+", " ");
+    return "dagId=" + dagID
+        + ", startTime=" + startTime
+        + ", finishTime=" + finishTime
+        + ", timeTaken=" + (finishTime - startTime)
+        + ", status=" + state.name()
+        + ", diagnostics=" + diagnostics
+        + ", counters=" + ((tezCounters == null) ? "null" :
+          (tezCounters.toString()
+            .replaceAll("\\n", ", ").replaceAll("\\s+", " ")));
   }
+
+  @Override
+  public void toSummaryProtoStream(OutputStream outputStream) throws IOException {
+    SummaryEventProto.Builder builder = RecoveryProtos.SummaryEventProto.newBuilder()
+        .setDagId(dagID.toString())
+        .setTimestamp(finishTime)
+        .setEventType(getEventType().ordinal())
+        .setEventPayload(ByteString.copyFrom(Ints.toByteArray(state.ordinal())));
+    builder.build().writeDelimitedTo(outputStream);
+  }
+
+  @Override
+  public void fromSummaryProtoStream(SummaryEventProto proto) throws IOException {
+    this.dagID = TezDAGID.fromString(proto.getDagId());
+    this.finishTime = proto.getTimestamp();
+    this.state = DAGState.values()[
+        Ints.fromByteArray(proto.getEventPayload().toByteArray())];
+  }
+
+  @Override
+  public boolean writeToRecoveryImmediately() {
+    return true;
+  }
+
+  public long getFinishTime() {
+    return this.finishTime;
+  }
+
+  public DAGState getState() {
+    return state;
+  }
+
+  public TezDAGID getDagID() {
+    return dagID;
+  }
+
+  public long getStartTime() {
+    return startTime;
+  }
+
+  public String getDiagnostics() {
+    return diagnostics;
+  }
+
+  public TezCounters getTezCounters() {
+    return tezCounters;
+  }
+
 }

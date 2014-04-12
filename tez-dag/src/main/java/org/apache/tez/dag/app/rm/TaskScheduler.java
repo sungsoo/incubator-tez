@@ -21,6 +21,7 @@ package org.apache.tez.dag.app.rm;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -28,6 +29,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.PriorityBlockingQueue;
@@ -45,6 +48,7 @@ import org.apache.hadoop.yarn.api.records.Container;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerStatus;
 import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
+import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.NodeReport;
 import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.Resource;
@@ -144,6 +148,9 @@ public class TaskScheduler extends AbstractService
   Map<ContainerId, HeldContainer> heldContainers =
       new HashMap<ContainerId, HeldContainer>();
   
+  Set<NodeId> blacklistedNodes = Collections
+      .newSetFromMap(new ConcurrentHashMap<NodeId, Boolean>());
+  
   Resource totalResources = Resource.newInstance(0, 0);
   Resource allocatedResources = Resource.newInstance(0, 0);
   
@@ -152,7 +159,7 @@ public class TaskScheduler extends AbstractService
   final String appTrackingUrl;
   final AppContext appContext;
 
-  boolean isStopped = false;
+  AtomicBoolean isStopped = new AtomicBoolean(false);
 
   private ContainerAssigner NODE_LOCAL_ASSIGNER = new NodeLocalContainerAssigner();
   private ContainerAssigner RACK_LOCAL_ASSIGNER = new RackLocalContainerAssigner();
@@ -161,7 +168,10 @@ public class TaskScheduler extends AbstractService
   DelayedContainerManager delayedContainerManager;
   long localitySchedulingDelay;
   long sessionDelay;
-  
+
+  @VisibleForTesting
+  protected AtomicBoolean shouldUnregister = new AtomicBoolean(false);
+
   class CRCookie {
     // Do not use these variables directly. Can caused mocked unit tests to fail.
     private Object task;
@@ -244,7 +254,8 @@ public class TaskScheduler extends AbstractService
     this.appContext = appContext;
   }
 
-  private ExecutorService createAppCallbackExecutorService() {
+  @VisibleForTesting
+  ExecutorService createAppCallbackExecutorService() {
     return Executors.newSingleThreadExecutor(new ThreadFactoryBuilder()
         .setNameFormat("TaskSchedulerAppCaller #%d").setDaemon(true).build());
   }
@@ -254,6 +265,7 @@ public class TaskScheduler extends AbstractService
   }
 
   public int getClusterNodeCount() {
+    // this can potentially be cheaper after YARN-1722
     return amRmClient.getClusterNodeCount();
   }
 
@@ -262,7 +274,11 @@ public class TaskScheduler extends AbstractService
     return new TaskSchedulerAppCallbackWrapper(realAppClient,
         appCallbackExecutor);
   }
-  
+
+  public void setShouldUnregister() {
+    this.shouldUnregister.set(true);
+  }
+
   // AbstractService methods
   @Override
   public synchronized void serviceInit(Configuration conf) {
@@ -339,17 +355,22 @@ public class TaskScheduler extends AbstractService
   @Override
   public void serviceStop() throws InterruptedException {
     // upcall to app outside of locks
-    AppFinalStatus status = appClientDelegate.getFinalAppStatus();
     try {
       delayedContainerManager.shutdown();
       // Wait for contianers to be released.
       delayedContainerManager.join(2000l);
-      // TODO TEZ-36 dont unregister automatically after reboot sent by RM
       synchronized (this) {
-        isStopped = true;
-        amRmClient.unregisterApplicationMaster(status.exitStatus,
-                                               status.exitMessage,
-                                               status.postCompletionTrackingUrl);
+        isStopped.set(true);
+        if (shouldUnregister.get()) {
+          AppFinalStatus status = appClientDelegate.getFinalAppStatus();
+          LOG.info("Unregistering application from RM"
+              + ", exitStatus=" + status.exitStatus
+              + ", exitMessage=" + status.exitMessage
+              + ", trackingURL=" + status.postCompletionTrackingUrl);
+          amRmClient.unregisterApplicationMaster(status.exitStatus,
+              status.exitMessage,
+              status.postCompletionTrackingUrl);
+        }
       }
 
       // call client.stop() without lock client will attempt to stop the callback
@@ -370,7 +391,7 @@ public class TaskScheduler extends AbstractService
   // AMRMClientAsync interface methods
   @Override
   public void onContainersCompleted(List<ContainerStatus> statuses) {
-    if(isStopped) {
+    if (isStopped.get()) {
       return;
     }
     Map<Object, ContainerStatus> appContainerStatus =
@@ -427,7 +448,7 @@ public class TaskScheduler extends AbstractService
 
   @Override
   public void onContainersAllocated(List<Container> containers) {
-    if (isStopped) {
+    if (isStopped.get()) {
       return;
     }
     Map<CookieContainerRequest, Container> assignedContainers;
@@ -568,6 +589,7 @@ public class TaskScheduler extends AbstractService
 
       Container containerToAssign = heldContainer.container;
 
+      heldContainer.incrementAssignmentAttempts();
       // Each time a container is seen, we try node, rack and non-local in that
       // order depending on matching level allowed
 
@@ -727,7 +749,7 @@ public class TaskScheduler extends AbstractService
 
   @Override
   public void onShutdownRequest() {
-    if(isStopped) {
+    if (isStopped.get()) {
       return;
     }
     // upcall to app must be outside locks
@@ -736,7 +758,7 @@ public class TaskScheduler extends AbstractService
 
   @Override
   public void onNodesUpdated(List<NodeReport> updatedNodes) {
-    if(isStopped) {
+    if (isStopped.get()) {
       return;
     }
     // ignore bad nodes for now
@@ -746,7 +768,7 @@ public class TaskScheduler extends AbstractService
 
   @Override
   public float getProgress() {
-    if(isStopped) {
+    if (isStopped.get()) {
       return 1;
     }
 
@@ -767,7 +789,7 @@ public class TaskScheduler extends AbstractService
 
   @Override
   public void onError(Throwable t) {
-    if(isStopped) {
+    if (isStopped.get()) {
       return;
     }
     appClientDelegate.onError(t);
@@ -777,6 +799,19 @@ public class TaskScheduler extends AbstractService
     return totalResources;
   }
 
+  public synchronized void blacklistNode(NodeId nodeId) {
+    LOG.info("Blacklisting node: " + nodeId);
+    amRmClient.addNodeToBlacklist(nodeId);
+    blacklistedNodes.add(nodeId);
+  }
+  
+  public synchronized void unblacklistNode(NodeId nodeId) {
+    if (blacklistedNodes.remove(nodeId)) {
+      LOG.info("UnBlacklisting node: " + nodeId);
+      amRmClient.removeNodeFromBlacklist(nodeId);
+    }
+  }
+  
   public synchronized void allocateTask(
       Object task,
       Resource capability,
@@ -885,11 +920,6 @@ public class TaskScheduler extends AbstractService
           " delayedContainers: " + delayedContainerManager.delayedContainers.size());
       }
       assert freeResources.getMemory() >= 0;
-      
-      if (delayedContainerManager.delayedContainers.size() > 0) {
-        // if we are holding onto containers then nothing to preempt from outside
-        return;
-      }
   
       CookieContainerRequest highestPriRequest = null;
       for(CookieContainerRequest request : taskRequests.values()) {
@@ -905,6 +935,74 @@ public class TaskScheduler extends AbstractService
         // highest priority request will not fit in existing free resources
         // free up some more
         // TODO this is subject to error wrt RM resource normalization
+        
+        // This request must have been considered for matching with all existing 
+        // containers when request was made.
+        Container lowestPriNewContainer = null;
+        // could not find anything to preempt. Check if we can release unused 
+        // containers
+        for (HeldContainer heldContainer : delayedContainerManager.delayedContainers) {
+          if (!heldContainer.isNew()) {
+            if (LOG.isDebugEnabled()) {
+              LOG.debug("Reused container exists. Wait for assignment loop to release it. "
+                  + heldContainer.getContainer().getId());
+            }
+            return;
+          }
+          if (heldContainer.geNumAssignmentAttempts() < 3) {
+            // we havent tried to assign this container at node/rack/ANY
+            if (LOG.isDebugEnabled()) {
+              LOG.debug("Brand new container. Wait for assignment loop to match it. "
+                  + heldContainer.getContainer().getId());
+            }
+            return;
+          }
+          Container container = heldContainer.getContainer();
+          if (lowestPriNewContainer == null ||
+              isHigherPriority(lowestPriNewContainer.getPriority(), container.getPriority())){
+            // there is a lower priority new container
+            lowestPriNewContainer = container;
+          }
+        }
+        
+        if (lowestPriNewContainer != null) {
+          LOG.info("Preempting new container: " + lowestPriNewContainer.getId() +
+              " with priority: " + lowestPriNewContainer.getPriority() + 
+              " to free resource for request: " + highestPriRequest +
+              " . Current free resources: " + freeResources);
+          releaseUnassignedContainers(Collections.singletonList(lowestPriNewContainer));
+          // We are returning an unused resource back the RM. The RM thinks it 
+          // has serviced our initial request and will not re-allocate this back
+          // to us anymore. So we need to ask for this again. If there is no
+          // outstanding request at that priority then its fine to not ask again.
+          // See TEZ-915 for more details
+          for (Map.Entry<Object, CookieContainerRequest> entry : taskRequests.entrySet()) {
+            Object task = entry.getKey();
+            CookieContainerRequest request = entry.getValue();
+            if (request.getPriority().equals(lowestPriNewContainer.getPriority())) {
+              LOG.info("Resending request for task again: " + task);
+              deallocateTask(task, true);
+              allocateTask(task, request.getCapability(), 
+                  (request.getNodes() == null ? null : 
+                    request.getNodes().toArray(new String[request.getNodes().size()])), 
+                    (request.getRacks() == null ? null : 
+                      request.getRacks().toArray(new String[request.getRacks().size()])), 
+                    request.getPriority(), 
+                    request.getCookie().getContainerSignature(),
+                    request.getCookie().getAppCookie());
+              break;
+            }
+          }
+          
+          return;
+        }
+        
+        // this assert will be a no-op in production but can help identify 
+        // invalid assumptions during testing
+        assert delayedContainerManager.delayedContainers.isEmpty();
+        
+        // there are no reused or new containers to release
+        // try to preempt running containers
         Map.Entry<Object, Container> preemptedEntry = null;
         for(Map.Entry<Object, Container> entry : taskAllocations.entrySet()) {
           HeldContainer heldContainer = heldContainers.get(entry.getValue().getId());
@@ -1111,8 +1209,11 @@ public class TaskScheduler extends AbstractService
 
   private void addTaskRequest(Object task,
                                 CookieContainerRequest request) {
-    // TODO TEZ-37 fix duplicate handling
-    taskRequests.put(task, request);
+    CookieContainerRequest oldRequest = taskRequests.put(task, request);
+    if (oldRequest != null) {
+      // remove all references of the request from AMRMClient
+      amRmClient.removeContainerRequest(oldRequest);
+    }
     amRmClient.addContainerRequest(request);
   }
 
@@ -1238,7 +1339,31 @@ public class TaskScheduler extends AbstractService
     }
     for (Entry<CookieContainerRequest, Container> entry : assignedContainers
         .entrySet()) {
-      informAppAboutAssignment(entry.getKey(), entry.getValue());
+      Container container = entry.getValue();
+      // check for blacklisted nodes. There may be race conditions between
+      // setting blacklist and receiving allocations
+      if (blacklistedNodes.contains(container.getNodeId())) {
+        CookieContainerRequest request = entry.getKey();
+        Object task = getTask(request);
+        LOG.info("Container: " + container.getId() + 
+            " allocated on blacklisted node: " + container.getNodeId() + 
+            " for task: " + task);
+        Object deAllocTask = deallocateContainer(container.getId());
+        assert deAllocTask.equals(task);
+        // its ok to submit the same request again because the RM will not give us
+        // the bad/unhealthy nodes again. The nodes may become healthy/unblacklisted
+        // and so its better to give the RM the full information.
+        allocateTask(task, request.getCapability(), 
+            (request.getNodes() == null ? null : 
+            request.getNodes().toArray(new String[request.getNodes().size()])), 
+            (request.getRacks() == null ? null : 
+              request.getRacks().toArray(new String[request.getRacks().size()])), 
+            request.getPriority(), 
+            request.getCookie().getContainerSignature(), 
+            request.getCookie().getAppCookie());
+      } else {
+        informAppAboutAssignment(entry.getKey(), container);
+      }
     }
   }
 
@@ -1388,7 +1513,7 @@ public class TaskScheduler extends AbstractService
       }
     }
 
-    private PriorityBlockingQueue<HeldContainer> delayedContainers =
+    PriorityBlockingQueue<HeldContainer> delayedContainers =
       new PriorityBlockingQueue<HeldContainer>(20,
         new HeldContainerTimerComparator());
 
@@ -1507,6 +1632,17 @@ public class TaskScheduler extends AbstractService
           LOG.debug("Trying to assign all delayed containers to newly received"
             + " tasks");
         }
+        Iterator<HeldContainer> iter = delayedContainers.iterator();
+        while(iter.hasNext()) {
+          HeldContainer delayedContainer = iter.next();
+          if (!heldContainers.containsKey(delayedContainer.getContainer().getId())) {
+            // this container is no longer held by us
+            LOG.info("AssignAll - Skipping delayed container as container is no longer"
+                + " running, containerId="
+                + delayedContainer.getContainer().getId());
+            iter.remove();
+          }
+        }
         assignedContainers = tryAssignReUsedContainers(
           new ContainerIterable(delayedContainers));
       }
@@ -1616,6 +1752,7 @@ public class TaskScheduler extends AbstractService
     private LocalityMatchLevel localityMatchLevel;
     private long containerExpiryTime;
     private CookieContainerRequest lastTaskInfo;
+    private int numAssignmentAttempts = 0;
     
     HeldContainer(Container container,
         long nextScheduleTime,
@@ -1633,6 +1770,14 @@ public class TaskScheduler extends AbstractService
     
     boolean isNew() {
       return firstContainerSignature == null;
+    }
+    
+    int geNumAssignmentAttempts() {
+      return numAssignmentAttempts;
+    }
+    
+    void incrementAssignmentAttempts() {
+      numAssignmentAttempts++;
     }
     
     public Container getContainer() {

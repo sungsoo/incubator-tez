@@ -45,6 +45,7 @@ import org.apache.hadoop.yarn.client.api.impl.ContainerManagementProtocolProxy;
 import org.apache.hadoop.yarn.client.api.impl.ContainerManagementProtocolProxy.ContainerManagementProtocolProxyData;
 import org.apache.hadoop.yarn.util.Clock;
 import org.apache.hadoop.yarn.util.Records;
+import org.apache.tez.dag.api.TezConfiguration;
 import org.apache.tez.dag.api.TezUncheckedException;
 import org.apache.tez.dag.app.AppContext;
 import org.apache.tez.dag.app.rm.NMCommunicatorEvent;
@@ -56,7 +57,6 @@ import org.apache.tez.dag.app.rm.container.AMContainerEventStopFailed;
 import org.apache.tez.dag.app.rm.container.AMContainerEventType;
 import org.apache.tez.dag.history.DAGHistoryEvent;
 import org.apache.tez.dag.history.events.ContainerLaunchedEvent;
-import org.apache.tez.mapreduce.hadoop.MRJobConfig;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
@@ -172,8 +172,9 @@ public class ContainerLauncherImpl extends AbstractService implements
         context.getEventHandler().handle(
             new AMContainerEventLaunched(containerID));
         ContainerLaunchedEvent lEvt = new ContainerLaunchedEvent(
-            containerID, clock.getTime());
-        context.getEventHandler().handle(new DAGHistoryEvent(lEvt));
+            containerID, clock.getTime(), context.getApplicationAttemptId());
+        context.getHistoryHandler().handle(new DAGHistoryEvent(
+            context.getCurrentDAGID(), lEvt));
 
         this.state = ContainerState.RUNNING;
       } catch (Throwable t) {
@@ -250,8 +251,8 @@ public class ContainerLauncherImpl extends AbstractService implements
         CommonConfigurationKeysPublic.IPC_CLIENT_CONNECTION_MAXIDLETIME_KEY,
         0);
     this.limitOnPoolSize = conf.getInt(
-        MRJobConfig.MR_AM_CONTAINERLAUNCHER_THREAD_COUNT_LIMIT,
-        MRJobConfig.DEFAULT_MR_AM_CONTAINERLAUNCHER_THREAD_COUNT_LIMIT);
+        TezConfiguration.TEZ_AM_CONTAINERLAUNCHER_THREAD_COUNT_LIMIT,
+        TezConfiguration.TEZ_AM_CONTAINERLAUNCHER_THREAD_COUNT_LIMIT_DEFAULT);
     LOG.info("Upper limit on the thread pool size is " + this.limitOnPoolSize);
   }
 

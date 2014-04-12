@@ -21,10 +21,10 @@ package org.apache.tez.dag.records;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.text.NumberFormat;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
-import org.apache.tez.dag.records.TezTaskID;
 
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
@@ -40,7 +40,7 @@ import com.google.common.cache.LoadingCache;
  * Second part is the task attempt number. <br>
  * <p>
  * Applications should never construct or parse TaskAttemptID strings
- * , but rather use appropriate constructors or {@link #forName(String)}
+ * , but rather use appropriate constructors or {@link Class#forName(String)}
  * method.
  *
  * @see TezTaskID
@@ -67,7 +67,7 @@ public class TezTaskAttemptID extends TezID {
   
   /**
    * Constructs a TaskAttemptID object from given {@link TezTaskID}.  
-   * @param taskId TaskID that this task belongs to  
+   * @param taskID TaskID that this task belongs to  
    * @param id the task attempt number
    */
   public static TezTaskAttemptID getInstance(TezTaskID taskID, int id) {
@@ -144,4 +144,36 @@ public class TezTaskAttemptID extends TezID {
     taskId.write(out);
     super.write(out);
   }
+
+  protected static final ThreadLocal<NumberFormat> tezTaskAttemptIdFormat = new ThreadLocal<NumberFormat>() {
+    @Override
+    public NumberFormat initialValue() {
+      NumberFormat fmt = NumberFormat.getInstance();
+      fmt.setGroupingUsed(false);
+      fmt.setMinimumIntegerDigits(1);
+      return fmt;
+    }
+  };
+
+  public static TezTaskAttemptID fromString(String taIdStr) {
+    try {
+      String[] split = taIdStr.split("_");
+      String rmId = split[1];
+      int appId = TezDAGID.tezAppIdFormat.get().parse(split[2]).intValue();
+      int dagId = TezDAGID.tezDagIdFormat.get().parse(split[3]).intValue();
+      int vId = TezVertexID.tezVertexIdFormat.get().parse(split[4]).intValue();
+      int taskId = TezTaskID.tezTaskIdFormat.get().parse(split[5]).intValue();
+      int id = tezTaskAttemptIdFormat.get().parse(split[6]).intValue();
+
+      return TezTaskAttemptID.getInstance(
+          TezTaskID.getInstance(
+              TezVertexID.getInstance(
+                  TezDAGID.getInstance(rmId, appId, dagId),
+                  vId), taskId), id);
+    } catch (Exception e) {
+      e.printStackTrace();
+    }
+    return null;
+  }
+
 }

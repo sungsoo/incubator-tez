@@ -17,12 +17,15 @@
  */
 package org.apache.tez.dag.api;
 
-public class Edge{
-  
+import org.apache.hadoop.classification.InterfaceAudience.Private;
+
+public class Edge {
+
   private final Vertex inputVertex;
   private final Vertex outputVertex;
   private final EdgeProperty edgeProperty;
-    
+
+  // InputVertex(EdgeInput) ----- Edge ----- OutputVertex(EdgeOutput)]
   public Edge(Vertex inputVertex, 
                Vertex outputVertex, 
                EdgeProperty edgeProperty) {
@@ -35,11 +38,11 @@ public class Edge{
   public Vertex getInputVertex() {
     return inputVertex;
   }
-  
+
   public Vertex getOutputVertex() {
     return outputVertex;
   }
-  
+
   public EdgeProperty getEdgeProperty() {
     return edgeProperty;
   }
@@ -47,6 +50,7 @@ public class Edge{
   /*
    * Used to identify the edge in the configuration
    */
+  @Private
   public String getId() {
     return String.valueOf(this.hashCode());
   }

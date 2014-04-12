@@ -26,10 +26,13 @@ import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.Vector;
 import java.util.Map.Entry;
@@ -46,8 +49,10 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.io.DataOutputBuffer;
+import org.apache.hadoop.io.Text;
 import org.apache.hadoop.ipc.ProtobufRpcEngine;
 import org.apache.hadoop.ipc.RPC;
+import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.yarn.api.ApplicationConstants;
@@ -66,10 +71,15 @@ import org.apache.hadoop.yarn.client.api.YarnClient;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.security.client.ClientToAMTokenIdentifier;
-import org.apache.hadoop.yarn.util.Apps;
 import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.util.Records;
 import org.apache.log4j.Level;
+import org.apache.tez.common.TezJobConfig;
+import org.apache.tez.common.TezYARNUtils;
+import org.apache.tez.common.impl.LogUtils;
+import org.apache.tez.common.security.JobTokenIdentifier;
+import org.apache.tez.common.security.JobTokenSecretManager;
+import org.apache.tez.common.security.TokenCache;
 import org.apache.tez.dag.api.DAG;
 import org.apache.tez.dag.api.DagTypeConverters;
 import org.apache.tez.dag.api.SessionNotRunning;
@@ -85,6 +95,10 @@ import org.apache.tez.dag.api.records.DAGProtos.DAGPlan;
 import org.apache.tez.dag.api.records.DAGProtos.PlanKeyValuePair;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Function;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.Lists;
 
 public class TezClientUtils {
 
@@ -99,13 +113,19 @@ public class TezClientUtils {
 
   /**
    * Setup LocalResource map for Tez jars based on provided Configuration
-   * @param conf Configuration to use to access Tez jars' locations
+   * 
+   * @param conf
+   *          Configuration to use to access Tez jars' locations
+   * @param credentials
+   *          a credentials instance into which tokens for the Tez local
+   *          resources will be populated
    * @return Map of LocalResources to use when launching Tez AM
    * @throws IOException
    */
   static Map<String, LocalResource> setupTezJarsLocalResources(
-      TezConfiguration conf)
+      TezConfiguration conf, Credentials credentials)
       throws IOException {
+    Preconditions.checkNotNull(credentials, "A non-null credentials object should be specified");
     Map<String, LocalResource> tezJarResources =
         new TreeMap<String, LocalResource>();
 
@@ -118,6 +138,8 @@ public class TezClientUtils {
           + ", " + TezConfiguration.TEZ_LIB_URIS
           + " is not defined in the configurartion");
     }
+    
+    List<Path> tezJarPaths = Lists.newArrayListWithCapacity(tezJarUris.length);
 
     for (String tezJarUri : tezJarUris) {
       URI uri;
@@ -137,6 +159,8 @@ public class TezClientUtils {
       }
       Path p = new Path(uri);
       FileSystem pathfs = p.getFileSystem(conf);
+      p = pathfs.makeQualified(p);
+      tezJarPaths.add(p);
       RemoteIterator<LocatedFileStatus> iter = pathfs.listFiles(p, false);
       while (iter.hasNext()) {
         LocatedFileStatus fStatus = iter.next();
@@ -161,17 +185,32 @@ public class TezClientUtils {
                 fStatus.getModificationTime()));
       }
     }
+
     if (tezJarResources.isEmpty()) {
       LOG.warn("No tez jars found in configured locations"
           + ". Ignoring for now. Errors may occur");
+    } else {
+      // Obtain credentials.
+      TokenCache.obtainTokensForFileSystems(credentials,
+          tezJarPaths.toArray(new Path[tezJarPaths.size()]), conf);
     }
     return tezJarResources;
+  }
+
+  static void processTezLocalCredentialsFile(Credentials credentials, Configuration conf)
+      throws IOException {
+    String path = conf.get(TezJobConfig.TEZ_CREDENTIALS_PATH);
+    if (path == null) {
+      return;
+    } else {
+      TokenCache.mergeBinaryTokens(credentials, conf, path);
+    }
   }
 
   /**
    * Verify or create the Staging area directory on the configured Filesystem
    * @param stagingArea Staging area directory path
-   * @return
+   * @return the FileSytem for the staging area directory
    * @throws IOException
    */
   public static FileSystem ensureStagingDirExists(Configuration conf,
@@ -206,6 +245,67 @@ public class TezClientUtils {
   }
 
   /**
+   * Obtains tokens for the DAG based on the list of URIs setup in the DAG. The
+   * fetched credentials are populated back into the DAG and can be retrieved
+   * via dag.getCredentials
+   * 
+   * @param dag
+   *          the dag for which credentials need to be setup
+   * @param sessionCredentials
+   *          session credentials which have already been obtained, and will be
+   *          required for the DAG
+   * @param conf
+   * @throws IOException
+   */
+  @Private
+  static void setupDAGCredentials(DAG dag, Credentials sessionCredentials,
+      Configuration conf) throws IOException {
+
+    Preconditions.checkNotNull(sessionCredentials);
+    LogUtils.logCredentials(LOG, sessionCredentials, "session");
+
+    Credentials dagCredentials = dag.getCredentials();
+    if (dagCredentials == null) {
+      dagCredentials = new Credentials();
+      dag.setCredentials(dagCredentials);
+    }
+    // All session creds are required for the DAG.
+    dagCredentials.mergeAll(sessionCredentials);
+    
+    // Add additional credentials based on any URIs that the user may have specified.
+    
+    // Obtain Credentials for any paths that the user may have configured.
+    Collection<URI> uris = dag.getURIsForCredentials();
+    if (uris != null && !uris.isEmpty()) {
+      Iterator<Path> pathIter = Iterators.transform(uris.iterator(), new Function<URI, Path>() {
+        @Override
+        public Path apply(URI input) {
+          return new Path(input);
+        }
+      });
+
+      Path[] paths = Iterators.toArray(pathIter, Path.class);
+      TokenCache.obtainTokensForFileSystems(dagCredentials, paths, conf);
+    }
+
+    // Obtain Credentials for the local resources configured on the DAG
+    try {
+      Set<Path> lrPaths = new HashSet<Path>();
+      for (Vertex v: dag.getVertices()) {
+        for (LocalResource lr: v.getTaskLocalResources().values()) {
+          lrPaths.add(ConverterUtils.getPathFromYarnURL(lr.getResource()));
+        }
+      }
+
+      Path[] paths = lrPaths.toArray(new Path[lrPaths.size()]);
+      TokenCache.obtainTokensForFileSystems(dagCredentials, paths, conf);
+
+    } catch (URISyntaxException e) {
+      throw new IOException(e);
+    }
+  }
+
+  /**
    * Create an ApplicationSubmissionContext to launch a Tez AM
    * @param conf TezConfiguration
    * @param appId Application Id
@@ -213,24 +313,24 @@ public class TezClientUtils {
    * @param amName Name for the application
    * @param amConfig AM Configuration
    * @param tezJarResources Resources to be used by the AM
-   * @return
+   * @param sessionCredentials the credential object which will be populated with session specific
+   * @return an ApplicationSubmissionContext to launch a Tez AM
    * @throws IOException
    * @throws YarnException
    */
   static ApplicationSubmissionContext createApplicationSubmissionContext(
       TezConfiguration conf, ApplicationId appId, DAG dag, String amName,
-      AMConfiguration amConfig,
-      Map<String, LocalResource> tezJarResources)
+      AMConfiguration amConfig, Map<String, LocalResource> tezJarResources,
+      Credentials sessionCreds)
           throws IOException, YarnException{
 
+    Preconditions.checkNotNull(sessionCreds);
+    
     FileSystem fs = TezClientUtils.ensureStagingDirExists(conf,
         amConfig.getStagingDir());
     Path binaryConfPath =  new Path(amConfig.getStagingDir(),
         TezConfiguration.TEZ_PB_BINARY_CONF_NAME + "." + appId.toString());
     binaryConfPath = fs.makeQualified(binaryConfPath);
-    
-    // TODO TEZ-674 - Obtain tokens for the staging dir. Ideally TokenCache should be used,
-    // but that's in a separate module. Similarly Master is in a separate module.
 
     // Setup resource requirements
     Resource capability = Records.newRecord(Resource.class);
@@ -244,13 +344,29 @@ public class TezClientUtils {
       LOG.debug("AppMaster capability = " + capability);
     }
 
+    // Setup required Credentials for the AM launch. DAG specific credentials
+    // are handled separately.
     ByteBuffer securityTokens = null;
     // Setup security tokens
+    Credentials amLaunchCredentials = new Credentials();
     if (amConfig.getCredentials() != null) {
-      DataOutputBuffer dob = new DataOutputBuffer();
-      amConfig.getCredentials().writeTokenStorageToStream(dob);
-      securityTokens = ByteBuffer.wrap(dob.getData(), 0,
-          dob.getLength());
+      amLaunchCredentials.addAll(amConfig.getCredentials());
+    }
+
+    // Add Staging dir creds to the list of session credentials.
+    TokenCache.obtainTokensForFileSystems(sessionCreds, new Path[] {binaryConfPath}, conf);
+
+    // Add session specific credentials to the AM credentials.
+    amLaunchCredentials.mergeAll(sessionCreds);
+
+    DataOutputBuffer dob = new DataOutputBuffer();
+    amLaunchCredentials.writeTokenStorageToStream(dob);
+    securityTokens = ByteBuffer.wrap(dob.getData(), 0, dob.getLength());
+
+    // Need to set credentials based on DAG and the URIs which have been set for the DAG.
+
+    if (dag != null) {
+      setupDAGCredentials(dag, sessionCreds, conf);
     }
 
     // Setup the command to run the AM
@@ -263,7 +379,7 @@ public class TezClientUtils {
     addLog4jSystemProperties(amLogLevel, vargs);
 
     vargs.add(amConfig.getAMConf().get(TezConfiguration.TEZ_AM_JAVA_OPTS,
-        TezConfiguration.DEFAULT_TEZ_AM_JAVA_OPTS));
+        TezConfiguration.TEZ_AM_JAVA_OPTS_DEFAULT));
     // FIX sun bug mentioned in TEZ-327
     vargs.add("-Dsun.nio.ch.bugLevel=''");
 
@@ -293,17 +409,22 @@ public class TezClientUtils {
 
     // Setup the CLASSPATH in environment
     // i.e. add { Hadoop jars, job jar, CWD } to classpath.
-    Map<String, String> environment = createEnvironment(conf);
+    String classpath = getFrameworkClasspath(conf);
+
+    Map<String, String> environment = new TreeMap<String, String>();
+    environment.put(Environment.CLASSPATH.name(), classpath);
 
     if (amConfig.getEnv() != null) {
       for (Map.Entry<String, String> entry : amConfig.getEnv().entrySet()) {
-        Apps.addToEnvironment(environment, entry.getKey(), entry.getValue());
+        TezYARNUtils.addToEnvironment(environment, entry.getKey(), entry.getValue(),
+            File.pathSeparator);
       }
     }
 
     Map<String, LocalResource> localResources =
         new TreeMap<String, LocalResource>();
 
+    // Not fetching credentials for AMLocalResources. Expect this to be provided via AMCredentials.
     if (amConfig.getLocalResources() != null) {
       localResources.putAll(amConfig.getLocalResources());
     }
@@ -357,7 +478,16 @@ public class TezClientUtils {
         DagTypeConverters.convertFromLocalResources(sessionJars);
       sessionJarsPBOutStream = FileSystem.create(fs, sessionJarsPath,
         new FsPermission(TEZ_AM_FILE_PERMISSION));
-      proto.writeTo(sessionJarsPBOutStream);
+      proto.writeDelimitedTo(sessionJarsPBOutStream);
+      
+      // Write out the initial list of resources which will be available in the AM
+      DAGProtos.PlanLocalResourcesProto amResourceProto;
+      if (amConfig.getLocalResources() != null && !amConfig.getLocalResources().isEmpty()) {
+        amResourceProto = DagTypeConverters.convertFromLocalResources(localResources);
+      } else {
+        amResourceProto = DAGProtos.PlanLocalResourcesProto.getDefaultInstance(); 
+      }
+      amResourceProto.writeDelimitedTo(sessionJarsPBOutStream);
     } finally {
       if (sessionJarsPBOutStream != null) {
         sessionJarsPBOutStream.close();
@@ -375,18 +505,12 @@ public class TezClientUtils {
     if(dag != null) {
 
       for (Vertex v : dag.getVertices()) {
-        if (v.getTaskLocalResources() == null) {
-          v.setTaskLocalResources(new TreeMap<String, LocalResource>());
-        }
         if (tezJarResources != null) {
           v.getTaskLocalResources().putAll(tezJarResources);
         }
         v.getTaskLocalResources().put(TezConfiguration.TEZ_PB_BINARY_CONF_NAME,
             binaryConfLRsrc);
 
-        if (v.getTaskEnvironment() == null) {
-          v.setTaskEnvironment(new TreeMap<String, String>());
-        }
         Map<String, String> taskEnv = v.getTaskEnvironment();
         for (Map.Entry<String, String> entry : environment.entrySet()) {
           String key = entry.getKey();
@@ -458,36 +582,39 @@ public class TezClientUtils {
     appContext.setAMContainerSpec(amContainer);
     
     appContext.setMaxAppAttempts(
-        finalTezConf.getInt(TezConfiguration.TEZ_AM_MAX_APP_ATTEMPTS, 
-            TezConfiguration.TEZ_AM_MAX_APP_ATTEMPTS_DEFAULT));
+      finalTezConf.getInt(TezConfiguration.TEZ_AM_MAX_APP_ATTEMPTS,
+        TezConfiguration.TEZ_AM_MAX_APP_ATTEMPTS_DEFAULT));
 
     return appContext;
 
   }
   
-  static Map<String, String> createEnvironment(Configuration conf) {
+  static String getFrameworkClasspath(Configuration conf) {
     Map<String, String> environment = new HashMap<String, String>();
 
-    Apps.addToEnvironment(environment,
+    TezYARNUtils.addToEnvironment(environment,
         Environment.CLASSPATH.name(),
-        Environment.PWD.$());
+        Environment.PWD.$(),
+        File.pathSeparator);
 
-    Apps.addToEnvironment(environment,
+    TezYARNUtils.addToEnvironment(environment,
         Environment.CLASSPATH.name(),
-        Environment.PWD.$() + File.separator + "*");
+        Environment.PWD.$() + File.separator + "*",
+        File.pathSeparator);
 
     // Add YARN/COMMON/HDFS jars and conf locations to path
     for (String c : conf.getStrings(
         YarnConfiguration.YARN_APPLICATION_CLASSPATH,
         YarnConfiguration.DEFAULT_YARN_APPLICATION_CLASSPATH)) {
-      Apps.addToEnvironment(environment, Environment.CLASSPATH.name(),
-          c.trim());
+      TezYARNUtils.addToEnvironment(environment, Environment.CLASSPATH.name(),
+          c.trim(), File.pathSeparator);
     }
-    return environment;
+    return environment.get(Environment.CLASSPATH.name());
   }
 
+  @Private
   @VisibleForTesting
-  static void addLog4jSystemProperties(String logLevel,
+  public static void addLog4jSystemProperties(String logLevel,
       List<String> vargs) {
     vargs.add("-Dlog4j.configuration="
         + TezConfiguration.TEZ_CONTAINER_LOG4J_PROPERTIES_FILE);
@@ -539,7 +666,7 @@ public class TezClientUtils {
    * @param fs FileSystem object
    * @param p Path of resource to localize
    * @param type LocalResource Type
-   * @return
+   * @return a YARN LocalResource for the given Path
    * @throws IOException
    */
   static LocalResource createLocalResource(FileSystem fs, Path p,
@@ -632,7 +759,9 @@ public class TezClientUtils {
           serviceAddr);
       userUgi.addToken(token);
     }
-    LOG.debug("Connecting to " + serviceAddr);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Connecting to Tez AM at " + serviceAddr);
+    }
     DAGClientAMProtocolBlockingPB proxy = null;
     try {
       proxy = userUgi.doAs(new PrivilegedExceptionAction<DAGClientAMProtocolBlockingPB>() {
@@ -648,5 +777,18 @@ public class TezClientUtils {
     }
     return proxy;
   }
+
+  @Private
+  public static void createSessionToken(String tokenIdentifier,
+      JobTokenSecretManager jobTokenSecretManager,
+      Credentials credentials) {
+    JobTokenIdentifier identifier = new JobTokenIdentifier(new Text(
+        tokenIdentifier));
+    Token<JobTokenIdentifier> sessionToken = new Token<JobTokenIdentifier>(identifier,
+        jobTokenSecretManager);
+    sessionToken.setService(identifier.getJobId());
+    TokenCache.setSessionToken(sessionToken, credentials);
+  }
+
 
 }

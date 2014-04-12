@@ -24,20 +24,25 @@ import java.util.Set;
 
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.tez.common.counters.TezCounters;
-import org.apache.tez.dag.api.EdgeManager;
+import org.apache.tez.dag.api.EdgeManagerDescriptor;
 import org.apache.tez.dag.api.InputDescriptor;
 import org.apache.tez.dag.api.OutputDescriptor;
 import org.apache.tez.dag.api.ProcessorDescriptor;
 import org.apache.tez.dag.api.VertexLocationHint;
+import org.apache.tez.dag.api.VertexLocationHint.TaskLocationHint;
 import org.apache.tez.dag.api.client.StatusGetOpts;
 import org.apache.tez.dag.api.records.DAGProtos.RootInputLeafOutputProto;
 import org.apache.tez.dag.api.records.DAGProtos.VertexPlan;
 import org.apache.tez.dag.api.client.ProgressBuilder;
 import org.apache.tez.dag.api.client.VertexStatusBuilder;
+import org.apache.tez.dag.app.AppContext;
 import org.apache.tez.dag.app.dag.impl.Edge;
 import org.apache.tez.dag.app.dag.impl.RootInputLeafOutputDescriptor;
+import org.apache.tez.dag.history.HistoryEvent;
 import org.apache.tez.dag.records.TezTaskID;
 import org.apache.tez.dag.records.TezVertexID;
+import org.apache.tez.runtime.api.OutputCommitter;
+import org.apache.tez.runtime.api.impl.GroupInputSpec;
 import org.apache.tez.runtime.api.impl.InputSpec;
 import org.apache.tez.runtime.api.impl.OutputSpec;
 
@@ -72,8 +77,10 @@ public interface Vertex extends Comparable<Vertex> {
   ProgressBuilder getVertexProgress();
   VertexStatusBuilder getVertexStatus(Set<StatusGetOpts> statusOptions);
 
+  TaskLocationHint getTaskLocationHint(TezTaskID taskID);
 
-  boolean setParallelism(int parallelism, Map<String, EdgeManager> sourceEdgeManagers);
+  boolean setParallelism(int parallelism, VertexLocationHint vertexLocationHint,
+      Map<String, EdgeManagerDescriptor> sourceEdgeManagers);
   void setVertexLocationHint(VertexLocationHint vertexLocationHint);
 
   // CHANGE THESE TO LISTS AND MAINTAIN ORDER?
@@ -82,6 +89,8 @@ public interface Vertex extends Comparable<Vertex> {
 
   Map<Vertex, Edge> getInputVertices();
   Map<Vertex, Edge> getOutputVertices();
+  
+  Map<String, OutputCommitter> getOutputCommitters();
 
   void setAdditionalInputs(List<RootInputLeafOutputProto> inputs);
   void setAdditionalOutputs(List<RootInputLeafOutputProto> outputs);
@@ -91,6 +100,10 @@ public interface Vertex extends Comparable<Vertex> {
 
   List<InputSpec> getInputSpecList(int taskIndex);
   List<OutputSpec> getOutputSpecList(int taskIndex);
+  
+  List<GroupInputSpec> getGroupInputSpecList(int taskIndex);
+  void addSharedOutputs(Set<String> outputs);
+  Set<String> getSharedOutputs();
 
   int getInputVerticesCount();
   int getOutputVerticesCount();
@@ -100,5 +113,11 @@ public interface Vertex extends Comparable<Vertex> {
   ProcessorDescriptor getProcessorDescriptor();
   public DAG getDAG();
   VertexTerminationCause getTerminationCause();
+
+  // TODO remove this once RootInputVertexManager is fixed to not use
+  // internal apis
+  AppContext getAppContext();
+
+  VertexState restoreFromEvent(HistoryEvent event);
 
 }

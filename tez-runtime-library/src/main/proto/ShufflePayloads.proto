@@ -21,7 +21,7 @@ option java_outer_classname = "ShuffleUserPayloads";
 option java_generate_equals_and_hash = true;
 
 message DataMovementEventPayloadProto {
-  optional bool output_generated = 1;
+  optional bytes empty_partitions = 1;
   optional string host = 2;
   optional int32 port = 3;
   optional string path_component = 4;
@@ -41,4 +41,11 @@ message InputInformationEventPayloadProto {
 
 message VertexManagerEventPayloadProto {
   optional int64 output_size = 1;
+}
+
+message ShuffleEdgeManagerConfigPayloadProto {
+  optional int32 num_source_task_outputs = 1;
+  optional int32 num_destination_tasks = 2;
+  optional int32 base_partition_range = 3;
+  optional int32 remainder_range_for_last_shuffler = 4;
 }

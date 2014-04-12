@@ -401,6 +401,9 @@ public class YARNRunner implements ClientProtocol {
 
     Resource taskResource = isMap ? MRHelpers.getMapResource(stageConf)
         : MRHelpers.getReduceResource(stageConf);
+    
+    stageConf.set(MRJobConfig.MROUTPUT_FILE_NAME_PREFIX, "part");
+    
     byte[] vertexUserPayload = MRHelpers.createUserPayloadFromConf(stageConf);
     Vertex vertex = new Vertex(vertexName, new ProcessorDescriptor(processorName).
         setUserPayload(vertexUserPayload),
@@ -411,7 +414,7 @@ public class YARNRunner implements ClientProtocol {
     }
     // Map only jobs.
     if (stageNum == totalStages -1) {
-      MRHelpers.addMROutput(vertex, vertexUserPayload);
+      MRHelpers.addMROutputLegacy(vertex, vertexUserPayload);
     }
 
     Map<String, String> taskEnv = new HashMap<String, String>();

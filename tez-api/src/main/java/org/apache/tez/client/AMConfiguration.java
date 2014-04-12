@@ -18,6 +18,7 @@
 
 package org.apache.tez.client;
 
+import java.io.File;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
@@ -26,6 +27,7 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.yarn.api.records.LocalResource;
+import org.apache.tez.common.TezYARNUtils;
 import org.apache.tez.dag.api.TezConfiguration;
 import org.apache.tez.dag.api.TezUncheckedException;
 
@@ -38,6 +40,17 @@ public class AMConfiguration {
   private final TezConfiguration amConf;
   private final Credentials credentials;
 
+  /**
+   * @param env
+   *          environment for the AM
+   * @param localResources
+   *          localResources which are required to run the AM
+   * @param conf
+   * @param credentials
+   *          credentials which will be needed in the AM. This includes
+   *          credentials which will be required to localize the specified
+   *          localResources.
+   */
   public AMConfiguration(Map<String, String> env,
       Map<String, LocalResource> localResources,
       TezConfiguration conf, Credentials credentials) {
@@ -48,11 +61,14 @@ public class AMConfiguration {
     }
     this.queueName = this.amConf.get(TezConfiguration.TEZ_QUEUE_NAME);
 
+    this.env = new HashMap<String, String>();
+    TezYARNUtils.setEnvFromInputString(this.env,
+        this.amConf.get(TezConfiguration.TEZ_AM_ENV),
+        File.pathSeparator);
     if (env != null) {
-      this.env = env;
-    } else {
-      this.env = new HashMap<String, String>(0);
+      this.env.putAll(env);
     }
+
     this.localResources = localResources;
     String stagingDirStr = amConf.get(TezConfiguration.TEZ_AM_STAGING_DIR);
     if (stagingDirStr == null || stagingDirStr.isEmpty()) {

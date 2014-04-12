@@ -18,19 +18,26 @@
 
 package org.apache.tez.runtime.api.impl;
 
+import static com.google.common.base.Preconditions.checkNotNull;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+import javax.annotation.Nullable;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.tez.common.counters.TezCounters;
+import org.apache.tez.dag.api.InputDescriptor;
+import org.apache.tez.dag.api.TezConfiguration;
 import org.apache.tez.dag.records.TezTaskAttemptID;
+import org.apache.tez.runtime.InputReadyTracker;
 import org.apache.tez.runtime.RuntimeTask;
 import org.apache.tez.runtime.api.Event;
+import org.apache.tez.runtime.api.Input;
 import org.apache.tez.runtime.api.TezInputContext;
 import org.apache.tez.runtime.api.impl.EventMetaData.EventProducerConsumerType;
+import org.apache.tez.runtime.common.resources.MemoryDistributor;
 
 public class TezInputContextImpl extends TezTaskContextImpl
     implements TezInputContext {
@@ -38,22 +45,44 @@ public class TezInputContextImpl extends TezTaskContextImpl
   private final byte[] userPayload;
   private final String sourceVertexName;
   private final EventMetaData sourceInfo;
+  private final int inputIndex;
+  private final Input input;
+  private final InputReadyTracker inputReadyTracker;
 
   @Private
   public TezInputContextImpl(Configuration conf, int appAttemptNumber,
-      TezUmbilical tezUmbilical, String taskVertexName,
+      TezUmbilical tezUmbilical, String dagName, String taskVertexName,
       String sourceVertexName, TezTaskAttemptID taskAttemptID,
-      TezCounters counters, byte[] userPayload,
+      TezCounters counters, int inputIndex, @Nullable byte[] userPayload,
       RuntimeTask runtimeTask, Map<String, ByteBuffer> serviceConsumerMetadata,
-      Map<String, String> auxServiceEnv) {
-    super(conf, appAttemptNumber, taskVertexName, taskAttemptID,
-        counters, runtimeTask, tezUmbilical, serviceConsumerMetadata,
-        auxServiceEnv);
+      Map<String, String> auxServiceEnv, MemoryDistributor memDist,
+      InputDescriptor inputDescriptor,  Input input, InputReadyTracker inputReadyTracker) {
+    super(conf, appAttemptNumber, dagName, taskVertexName, taskAttemptID,
+        wrapCounters(counters, taskVertexName, sourceVertexName, conf),
+        runtimeTask, tezUmbilical, serviceConsumerMetadata,
+        auxServiceEnv, memDist, inputDescriptor);
+    checkNotNull(inputIndex, "inputIndex is null");
+    checkNotNull(sourceVertexName, "sourceVertexName is null");
+    checkNotNull(input, "input is null");
+    checkNotNull(inputReadyTracker, "inputReadyTracker is null");
     this.userPayload = userPayload;
+    this.inputIndex = inputIndex;
     this.sourceVertexName = sourceVertexName;
     this.sourceInfo = new EventMetaData(
         EventProducerConsumerType.INPUT, taskVertexName, sourceVertexName,
         taskAttemptID);
+    this.input = input;
+    this.inputReadyTracker = inputReadyTracker;
+  }
+
+  private static TezCounters wrapCounters(TezCounters tezCounters, String taskVertexName,
+      String edgeVertexName, Configuration conf) {
+    if (conf.getBoolean(TezConfiguration.TEZ_TASK_GENERATE_COUNTERS_PER_IO,
+        TezConfiguration.TEZ_TASK_GENERATE_COUNTERS_PER_IO_DEFAULT)) {
+      return new TezCountersDelegate(tezCounters, taskVertexName, edgeVertexName, "INPUT");
+    } else {
+      return tezCounters;
+    }
   }
 
   @Override
@@ -70,6 +99,11 @@ public class TezInputContextImpl extends TezTaskContextImpl
   public byte[] getUserPayload() {
     return userPayload;
   }
+  
+  @Override
+  public int getInputIndex() {
+    return inputIndex;
+  }
 
   @Override
   public String getSourceVertexName() {
@@ -79,5 +113,10 @@ public class TezInputContextImpl extends TezTaskContextImpl
   @Override
   public void fatalError(Throwable exception, String message) {
     super.signalFatalError(exception, message, sourceInfo);
+  }
+
+  @Override
+  public void inputIsReady() {
+    inputReadyTracker.setInputIsReady(input);
   }
 }

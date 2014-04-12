@@ -18,11 +18,14 @@
 
 package org.apache.tez.runtime.library.common.shuffle.impl;
 
+import java.io.IOException;
 import java.net.URI;
+import java.util.BitSet;
 import java.util.List;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.tez.common.TezUtils;
 import org.apache.tez.dag.api.TezUncheckedException;
 import org.apache.tez.runtime.api.Event;
 import org.apache.tez.runtime.api.TezInputContext;
@@ -64,8 +67,6 @@ public class ShuffleInputEventHandler {
   }
 
   private void processDataMovementEvent(DataMovementEvent dmEvent) {
-    // FIXME TODO NEWTEZ
-    // Preconditions.checkState(shuffleRangeSet == true, "Shuffle Range must be set before a DataMovementEvent is processed");
     DataMovementEventPayloadProto shufflePayload;
     try {
       shufflePayload = DataMovementEventPayloadProto.parseFrom(dmEvent.getUserPayload());
@@ -74,9 +75,9 @@ public class ShuffleInputEventHandler {
     } 
     int partitionId = dmEvent.getSourceIndex();
     URI baseUri = getBaseURI(shufflePayload.getHost(), shufflePayload.getPort(), partitionId);
-    InputAttemptIdentifier srcAttemptIdentifier = new InputAttemptIdentifier(dmEvent.getTargetIndex(), dmEvent.getVersion(), shufflePayload.getPathComponent());
+    InputAttemptIdentifier srcAttemptIdentifier = 
+        new InputAttemptIdentifier(dmEvent.getTargetIndex(), dmEvent.getVersion(), shufflePayload.getPathComponent());
     LOG.info("DataMovementEvent baseUri:" + baseUri + ", src: " + srcAttemptIdentifier);
-    scheduler.addKnownMapOutput(shufflePayload.getHost(), partitionId, baseUri.toString(), srcAttemptIdentifier);
     
     // TODO NEWTEZ See if this duration hack can be removed.
     int duration = shufflePayload.getRunDuration();
@@ -84,11 +85,28 @@ public class ShuffleInputEventHandler {
       maxMapRuntime = duration;
       scheduler.informMaxMapRunTime(maxMapRuntime);
     }
+    if (shufflePayload.hasEmptyPartitions()) {
+      try {
+        byte[] emptyPartitions = TezUtils.decompressByteStringToByteArray(shufflePayload.getEmptyPartitions());
+        BitSet emptyPartitionsBitSet = TezUtils.fromByteArray(emptyPartitions);
+        if (emptyPartitionsBitSet.get(partitionId)) {
+          LOG.info("Source partition: " + partitionId + " did not generate any data. SrcAttempt: ["
+              + srcAttemptIdentifier + "]. Not fetching.");
+          scheduler.copySucceeded(srcAttemptIdentifier, null, 0, 0, 0, null);
+          return;
+        }
+      } catch (IOException e) {
+        throw new TezUncheckedException("Unable to set " +
+                "the empty partition to succeeded", e);
+      }
+    }
+    scheduler.addKnownMapOutput(shufflePayload.getHost(), shufflePayload.getPort(), 
+        partitionId, baseUri.toString(), srcAttemptIdentifier);
   }
   
   private void processTaskFailedEvent(InputFailedEvent ifEvent) {
-    InputAttemptIdentifier taIdentifier = new InputAttemptIdentifier(ifEvent.getSourceIndex(), ifEvent.getVersion());
-    scheduler.obsoleteMapOutput(taIdentifier);
+    InputAttemptIdentifier taIdentifier = new InputAttemptIdentifier(ifEvent.getTargetIndex(), ifEvent.getVersion());
+    scheduler.obsoleteInput(taIdentifier);
     LOG.info("Obsoleting output of src-task: " + taIdentifier);
   }
 

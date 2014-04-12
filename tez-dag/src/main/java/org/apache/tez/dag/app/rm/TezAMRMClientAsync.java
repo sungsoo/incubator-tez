@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.ResourceRequest;
@@ -80,6 +81,16 @@ public class TezAMRMClientAsync<T extends ContainerRequest> extends AMRMClientAs
     }
     return iter.next();
   }
+  
+  // Remove after YARN-1723 is fixed
+  public synchronized void addNodeToBlacklist(NodeId nodeId) {
+    client.updateBlacklist(Collections.singletonList(nodeId.getHost()), null);
+  }
+  
+  //Remove after YARN-1723 is fixed
+   public synchronized void removeNodeFromBlacklist(NodeId nodeId) {
+     client.updateBlacklist(null, Collections.singletonList(nodeId.getHost()));
+   }
 
   @Override
   public synchronized void addContainerRequest(T req) {

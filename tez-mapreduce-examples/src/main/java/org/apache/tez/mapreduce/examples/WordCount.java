@@ -41,6 +41,7 @@ import org.apache.hadoop.mapreduce.security.TokenCache;
 import org.apache.hadoop.mapreduce.split.TezGroupedSplitsInputFormat;
 import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.util.GenericOptionsParser;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.LocalResource;
 import org.apache.tez.client.AMConfiguration;
@@ -108,6 +109,12 @@ public class WordCount {
     @Override
     public void run(Map<String, LogicalInput> inputs,
         Map<String, LogicalOutput> outputs) throws Exception {
+      for (LogicalInput input : inputs.values()) {
+        input.start();
+      }
+      for (LogicalOutput output : outputs.values()) {
+        output.start();
+      }
       Preconditions.checkArgument(inputs.size() == 1);
       Preconditions.checkArgument(outputs.size() == 1);
       MRInput input = (MRInput) inputs.values().iterator().next();
@@ -146,6 +153,14 @@ public class WordCount {
     public void run(Map<String, LogicalInput> inputs,
         Map<String, LogicalOutput> outputs) throws Exception {
       Preconditions.checkArgument(inputs.size() == 1);
+
+      for (LogicalInput input : inputs.values()) {
+        input.start();
+      }
+      for (LogicalOutput output : outputs.values()) {
+        output.start();
+      }
+
       MROutput out = (MROutput) outputs.values().iterator().next();
       KeyValueWriter kvWriter = out.getWriter();
       KeyValuesReader kvReader = (KeyValuesReader) inputs.values().iterator().next().getReader();
@@ -192,7 +207,7 @@ public class WordCount {
     finalReduceConf.set(MRJobConfig.OUTPUT_FORMAT_CLASS_ATTR,
         TextOutputFormat.class.getName());
     finalReduceConf.set(FileOutputFormat.OUTDIR, outputPath);
-    finalReduceConf.setBoolean("mapred.mapper.new-api", true);
+    finalReduceConf.setBoolean("mapred.mapper.new-api", false);
 
     MultiStageMRConfToTezTranslator.translateVertexConfToTez(finalReduceConf,
         mapStageConf);
@@ -382,12 +397,15 @@ public class WordCount {
   }
 
   public static void main(String[] args) throws Exception {
-    if ((args.length%2) != 0) {
+    Configuration conf = new Configuration();
+    String [] otherArgs = new GenericOptionsParser(conf, args).getRemainingArgs();
+
+    if (otherArgs.length != 2) {
       printUsage();
       System.exit(2);
     }
     WordCount job = new WordCount();
-    job.run(args[0], args[1], null);
+    job.run(otherArgs[0], otherArgs[1], conf);
   }
 
 }

@@ -17,36 +17,56 @@
 
 package org.apache.tez.runtime.api.impl;
 
+import static com.google.common.base.Preconditions.checkNotNull;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
+import javax.annotation.Nullable;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.util.StringInterner;
 import org.apache.tez.dag.api.ProcessorDescriptor;
 import org.apache.tez.dag.records.TezTaskAttemptID;
 
+import com.google.common.collect.Lists;
+
 public class TaskSpec implements Writable {
 
   private TezTaskAttemptID taskAttemptId;
+  private String dagName;
   private String vertexName;
   private ProcessorDescriptor processorDescriptor;
   private List<InputSpec> inputSpecList;
   private List<OutputSpec> outputSpecList;
+  private List<GroupInputSpec> groupInputSpecList;
 
   public TaskSpec() {
   }
 
   public TaskSpec(TezTaskAttemptID taskAttemptID,
-      String vertexName, ProcessorDescriptor processorDescriptor,
-      List<InputSpec> inputSpecList, List<OutputSpec> outputSpecList) {
+      String dagName, String vertexName,
+      ProcessorDescriptor processorDescriptor,
+      List<InputSpec> inputSpecList, List<OutputSpec> outputSpecList, 
+      @Nullable List<GroupInputSpec> groupInputSpecList) {
+    checkNotNull(taskAttemptID, "taskAttemptID is null");
+    checkNotNull(dagName, "dagName is null");
+    checkNotNull(vertexName, "vertexName is null");
+    checkNotNull(processorDescriptor, "processorDescriptor is null");
+    checkNotNull(inputSpecList, "inputSpecList is null");
+    checkNotNull(outputSpecList, "outputSpecList is null");
     this.taskAttemptId = taskAttemptID;
+    this.dagName = StringInterner.weakIntern(dagName);
     this.vertexName = StringInterner.weakIntern(vertexName);
     this.processorDescriptor = processorDescriptor;
     this.inputSpecList = inputSpecList;
     this.outputSpecList = outputSpecList;
+    this.groupInputSpecList = groupInputSpecList;
+  }
+
+  public String getDAGName() {
+    return dagName;
   }
 
   public String getVertexName() {
@@ -68,10 +88,15 @@ public class TaskSpec implements Writable {
   public List<OutputSpec> getOutputs() {
     return outputSpecList;
   }
+  
+  public List<GroupInputSpec> getGroupInputs() {
+    return groupInputSpecList;
+  }
 
   @Override
   public void write(DataOutput out) throws IOException {
     taskAttemptId.write(out);
+    out.writeUTF(dagName);
     out.writeUTF(vertexName);
     processorDescriptor.write(out);
     out.writeInt(inputSpecList.size());
@@ -82,12 +107,21 @@ public class TaskSpec implements Writable {
     for (OutputSpec outputSpec : outputSpecList) {
       outputSpec.write(out);
     }
+    if (groupInputSpecList != null && !groupInputSpecList.isEmpty()) {
+      out.writeBoolean(true);
+      out.writeInt(groupInputSpecList.size());
+      for (GroupInputSpec group : groupInputSpecList) {
+        group.write(out);
+      }
+    } else {
+      out.writeBoolean(false);
+    }
   }
 
   @Override
   public void readFields(DataInput in) throws IOException {
     taskAttemptId = TezTaskAttemptID.readTezTaskAttemptID(in);
-    // TODO ZZZ Intern this.
+    dagName = StringInterner.weakIntern(in.readUTF());
     vertexName = StringInterner.weakIntern(in.readUTF());
     // TODO TEZ-305 convert this to PB
     processorDescriptor = new ProcessorDescriptor();
@@ -106,12 +140,23 @@ public class TaskSpec implements Writable {
       outputSpec.readFields(in);
       outputSpecList.add(outputSpec);
     }
+    boolean hasGroupInputs = in.readBoolean();
+    if (hasGroupInputs) {
+      int numGroups = in.readInt();
+      groupInputSpecList = Lists.newArrayListWithCapacity(numGroups);
+      for (int i=0; i<numGroups; ++i) {
+        GroupInputSpec group = new GroupInputSpec();
+        group.readFields(in);
+        groupInputSpecList.add(group);
+      }
+    }
   }
 
   @Override
   public String toString() {
     StringBuffer sb = new StringBuffer();
-    sb.append("VertexName: " + vertexName);
+    sb.append("DAGName : " + dagName);
+    sb.append(", VertexName: " + vertexName);
     sb.append(", TaskAttemptID:" + taskAttemptId);
     sb.append(", processorName=" + processorDescriptor.getClassName()
         + ", inputSpecListSize=" + inputSpecList.size()
@@ -125,6 +170,13 @@ public class TaskSpec implements Writable {
       sb.append("{" + i.toString() + "}, ");
     }
     sb.append("]");
+    if (groupInputSpecList != null && !groupInputSpecList.isEmpty()) {
+      sb.append(" groupInputSpecList=[");
+      for (GroupInputSpec group : groupInputSpecList) {
+        sb.append("{" + group.toString() + "}, ");
+      }
+      sb.append("]");
+    }
     return sb.toString();
   }
 

@@ -20,19 +20,19 @@ package org.apache.tez.runtime.library.common;
 
 public class InputIdentifier {
 
-  private final int srcTaskIndex;
+  private final int inputIndex;
   
-  public InputIdentifier(int srcTaskIndex) {
-    this.srcTaskIndex = srcTaskIndex;
+  public InputIdentifier(int srcInputIndex) {
+    this.inputIndex = srcInputIndex;
   }
 
-  public int getSrcTaskIndex() {
-    return this.srcTaskIndex;
+  public int getInputIndex() {
+    return this.inputIndex;
   }
 
   @Override
   public int hashCode() {
-    return srcTaskIndex;
+    return inputIndex;
   }
 
   @Override
@@ -44,13 +44,13 @@ public class InputIdentifier {
     if (getClass() != obj.getClass())
       return false;
     InputIdentifier other = (InputIdentifier) obj;
-    if (srcTaskIndex != other.srcTaskIndex)
+    if (inputIndex != other.inputIndex)
       return false;
     return true;
   }
 
   @Override
   public String toString() {
-    return "InputIdentifier [srcTaskIndex=" + srcTaskIndex + "]";
+    return "InputIdentifier [inputIndex=" + inputIndex + "]";
   }
 }

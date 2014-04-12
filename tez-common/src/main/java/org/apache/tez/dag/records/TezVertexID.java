@@ -46,7 +46,7 @@ import com.google.common.cache.LoadingCache;
 @InterfaceStability.Stable
 public class TezVertexID extends TezID {
   public static final String VERTEX = "vertex";
-  protected static final ThreadLocal<NumberFormat> idFormat = new ThreadLocal<NumberFormat>() {
+  static final ThreadLocal<NumberFormat> tezVertexIdFormat = new ThreadLocal<NumberFormat>() {
 
     @Override
     public NumberFormat initialValue() {
@@ -74,9 +74,8 @@ public class TezVertexID extends TezID {
   }
 
   /**
-   * Constructs a TaskID object from given {@link TezDAGID}.
-   * @param applicationId JobID that this tip belongs to
-   * @param type the {@link TezTaskType} of the task
+   * Constructs a TezVertexID object from given {@link TezDAGID}.
+   * @param dagId TezDAGID object for this TezVertexID
    * @param id the tip number
    */
   public static TezVertexID getInstance(TezDAGID dagId, int id) {
@@ -143,12 +142,29 @@ public class TezVertexID extends TezID {
   protected StringBuilder appendTo(StringBuilder builder) {
     return dagId.appendTo(builder).
         append(SEPARATOR).
-        append(idFormat.get().format(id));
+        append(tezVertexIdFormat.get().format(id));
   }
 
   @Override
   public int hashCode() {
     return dagId.hashCode() * 530017 + id;
+  }
+
+  public static TezVertexID fromString(String taskIdStr) {
+    try {
+      String[] split = taskIdStr.split("_");
+      String rmId = split[1];
+      int appId = TezDAGID.tezAppIdFormat.get().parse(split[2]).intValue();
+      int dagId = TezDAGID.tezDagIdFormat.get().parse(split[3]).intValue();
+      int id = tezVertexIdFormat.get().parse(split[4]).intValue();
+
+      return TezVertexID.getInstance(
+              TezDAGID.getInstance(rmId, appId, dagId),
+              id);
+    } catch (Exception e) {
+      e.printStackTrace();
+    }
+    return null;
   }
 
 }

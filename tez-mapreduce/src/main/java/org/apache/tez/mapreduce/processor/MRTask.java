@@ -22,10 +22,8 @@ import java.io.IOException;
 import java.net.URI;
 import java.text.NumberFormat;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 import java.util.Map.Entry;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -36,12 +34,14 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.LocalDirAllocator;
 import org.apache.hadoop.fs.FileSystem.Statistics;
+import org.apache.hadoop.fs.LocalDirAllocator;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.DataInputBuffer;
 import org.apache.hadoop.io.RawComparator;
 import org.apache.hadoop.mapred.FileAlreadyExistsException;
+import org.apache.hadoop.mapred.FileOutputCommitter;
+import org.apache.hadoop.mapred.FileOutputFormat;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.JobContext;
 import org.apache.hadoop.mapred.RawKeyValueIterator;
@@ -57,18 +57,16 @@ import org.apache.hadoop.mapreduce.task.ReduceContextImpl;
 import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.util.DiskChecker.DiskErrorException;
 import org.apache.hadoop.util.Progress;
 import org.apache.hadoop.util.StringUtils;
-import org.apache.hadoop.util.DiskChecker.DiskErrorException;
 import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
-import org.apache.hadoop.yarn.util.ResourceCalculatorProcessTree;
 import org.apache.tez.common.TezJobConfig;
 import org.apache.tez.common.TezTaskStatus.State;
 import org.apache.tez.common.TezUtils;
-import org.apache.tez.common.counters.TaskCounter;
-import org.apache.tez.common.counters.TezCounter;
 import org.apache.tez.common.counters.TezCounters;
 import org.apache.tez.common.security.JobTokenIdentifier;
+import org.apache.tez.common.security.TokenCache;
 import org.apache.tez.dag.records.TezDAGID;
 import org.apache.tez.mapreduce.hadoop.DeprecatedKeys;
 import org.apache.tez.mapreduce.hadoop.IDConverter;
@@ -76,11 +74,11 @@ import org.apache.tez.mapreduce.hadoop.MRConfig;
 import org.apache.tez.mapreduce.hadoop.MRJobConfig;
 import org.apache.tez.mapreduce.hadoop.mapred.TaskAttemptContextImpl;
 import org.apache.tez.mapreduce.hadoop.mapreduce.JobContextImpl;
-import org.apache.tez.mapreduce.output.MROutput;
+import org.apache.tez.mapreduce.output.MROutputLegacy;
+import org.apache.tez.runtime.api.LogicalInput;
 import org.apache.tez.runtime.api.LogicalOutput;
 import org.apache.tez.runtime.api.TezProcessorContext;
 import org.apache.tez.runtime.library.common.Constants;
-import org.apache.tez.runtime.library.common.security.TokenCache;
 import org.apache.tez.runtime.library.common.sort.impl.TezRawKeyValueIterator;
 
 @SuppressWarnings("deprecation")
@@ -95,13 +93,13 @@ public abstract class MRTask {
 
   // Current counters
   transient TezCounters counters;
-  protected GcTimeUpdater gcUpdater;
-  private ResourceCalculatorProcessTree pTree;
-  private long initCpuCumulativeTime = 0;
   protected TezProcessorContext processorContext;
   protected TaskAttemptID taskAttemptId;
   protected Progress progress = new Progress();
   protected SecretKey jobTokenSecret;
+  
+  LogicalInput input;
+  LogicalOutput output;
 
   boolean isMap;
 
@@ -118,12 +116,6 @@ public abstract class MRTask {
 
   protected MRTaskReporter mrReporter;
   protected boolean useNewApi;
-
-  /**
-   * A Map where Key-> URIScheme and value->FileSystemStatisticUpdater
-   */
-  private Map<String, FileSystemStatisticUpdater> statisticUpdaters =
-     new HashMap<String, FileSystemStatisticUpdater>();
 
   public MRTask(boolean isMap) {
     this.isMap = isMap;
@@ -144,9 +136,6 @@ public abstract class MRTask {
             (isMap ? TaskType.MAP : TaskType.REDUCE),
             context.getTaskIndex()),
           context.getTaskAttemptNumber());
-    // TODO TEZAM4 Figure out initialization / run sequence of Input, Process,
-    // Output. Phase is MR specific.
-    gcUpdater = new GcTimeUpdater(counters);
 
     byte[] userPayload = context.getUserPayload();
     Configuration conf = TezUtils.createConfFromUserPayload(userPayload);
@@ -161,8 +150,6 @@ public abstract class MRTask {
       taskAttemptId.toString());
     jobConf.setInt(MRJobConfig.APPLICATION_ATTEMPT_ID,
         context.getDAGAttemptNumber());
-
-    initResourceCalculatorPlugin();
 
     LOG.info("MRTask.inited: taskAttemptId = " + taskAttemptId.toString());
 
@@ -205,7 +192,7 @@ public abstract class MRTask {
     // Set it in conf, so as to be able to be used the the OutputCommitter.
 
     // Not needed. This is probably being set via the source/consumer meta
-    Token<JobTokenIdentifier> jobToken = TokenCache.getJobToken(credentials);
+    Token<JobTokenIdentifier> jobToken = TokenCache.getSessionToken(credentials);
     if (jobToken != null) {
       // Will MR ever run without a job token.
       SecretKey sk = JobTokenSecretManager.createSecretKey(jobToken
@@ -217,11 +204,6 @@ public abstract class MRTask {
 
     configureLocalDirs();
 
-    if (jobConf.get(TezJobConfig.DAG_CREDENTIALS_BINARY) != null) {
-      jobConf.set(MRJobConfig.MAPREDUCE_JOB_CREDENTIALS_BINARY,
-          jobConf.get(TezJobConfig.DAG_CREDENTIALS_BINARY));
-    }
-
     // Set up the DistributedCache related configs
     setupDistributedCacheConfig(jobConf);
   }
@@ -229,7 +211,9 @@ public abstract class MRTask {
   private void configureLocalDirs() throws IOException {
     // TODO NEWTEZ Is most of this functionality required ?
     jobConf.setStrings(TezJobConfig.LOCAL_DIRS, processorContext.getWorkDirs());
-    jobConf.set(TezJobConfig.TASK_LOCAL_RESOURCE_DIR, System.getenv(Environment.PWD.name()));
+    if (jobConf.get(TezJobConfig.TASK_LOCAL_RESOURCE_DIR) == null) {
+      jobConf.set(TezJobConfig.TASK_LOCAL_RESOURCE_DIR, System.getenv(Environment.PWD.name()));
+    }
 
     jobConf.setStrings(MRConfig.LOCAL_DIR, processorContext.getWorkDirs());
 
@@ -319,26 +303,17 @@ public abstract class MRTask {
     }
   }
 
-
-  private void initResourceCalculatorPlugin() {
-    Class<? extends ResourceCalculatorProcessTree> clazz =
-        this.jobConf.getClass(MRConfig.RESOURCE_CALCULATOR_PROCESS_TREE,
-            null, ResourceCalculatorProcessTree.class);
-    pTree = ResourceCalculatorProcessTree
-        .getResourceCalculatorProcessTree(System.getenv().get("JVM_PID"), clazz, this.jobConf);
-    LOG.info(" Using ResourceCalculatorProcessTree : " + pTree);
-    if (pTree != null) {
-      pTree.updateProcessTree();
-      initCpuCumulativeTime = pTree.getCumulativeCpuTime();
-    }
-  }
-
   public TezProcessorContext getUmbilical() {
     return this.processorContext;
   }
 
-  public void initTask() throws IOException,
+  public void initTask(LogicalOutput output) throws IOException,
                                 InterruptedException {
+    // By this time output has been initialized
+    this.output = output;
+    if (output instanceof MROutputLegacy) {
+      committer = ((MROutputLegacy)output).getOutputCommitter();
+    }
     this.mrReporter = new MRTaskReporter(processorContext);
     this.useNewApi = jobConf.getUseNewMapper();
     TezDAGID dagId = IDConverter.fromMRTaskAttemptId(taskAttemptId).getTaskID()
@@ -367,14 +342,6 @@ public abstract class MRTask {
   public State getState() {
     // TODO Auto-generated method stub
     return null;
-  }
-
-  public OutputCommitter getCommitter() {
-    return committer;
-  }
-
-  public void setCommitter(OutputCommitter committer) {
-    this.committer = committer;
   }
 
   public TezCounters getCounters() { return counters; }
@@ -418,15 +385,14 @@ public abstract class MRTask {
       InterruptedException {
   }
 
-  public void done(LogicalOutput output) throws IOException, InterruptedException {
-    updateCounters();
+  public void done() throws IOException, InterruptedException {
 
     LOG.info("Task:" + taskAttemptId + " is done."
         + " And is in the process of committing");
     // TODO change this to use the new context
     // TODO TEZ Interaciton between Commit and OutputReady. Merge ?
-    if (output instanceof MROutput) {
-      MROutput sOut = (MROutput)output;
+    if (output instanceof MROutputLegacy) {
+      MROutputLegacy sOut = (MROutputLegacy)output;
       if (sOut.isCommitRequired()) {
         //wait for commit approval and commit
         // TODO EVENTUALLY - Commit is not required for map tasks.
@@ -435,17 +401,11 @@ public abstract class MRTask {
       }
     }
     taskDone.set(true);
-    // Make sure we send at least one set of counter increments. It's
-    // ok to call updateCounters() in this thread after comm thread stopped.
-    updateCounters();
     sendLastUpdate();
-    //signal the tasktracker that we are done
-    //sendDone(umbilical);
   }
 
   /**
    * Send a status update to the task tracker
-   * @param umbilical
    * @throws IOException
    */
   public void statusUpdate() throws IOException, InterruptedException {
@@ -460,7 +420,7 @@ public abstract class MRTask {
     statusUpdate();
   }
 
-  private void commit(MROutput output) throws IOException {
+  private void commit(MROutputLegacy output) throws IOException {
     int retries = 3;
     while (true) {
       // This will loop till the AM asks for the task to be killed. As
@@ -497,7 +457,7 @@ public abstract class MRTask {
   }
 
   private
-  void discardOutput(MROutput output) {
+  void discardOutput(MROutputLegacy output) {
     try {
       output.abort();
     } catch (IOException ioe)  {
@@ -505,71 +465,6 @@ public abstract class MRTask {
                StringUtils.stringifyException(ioe));
     }
   }
-
-
-  public void updateCounters() {
-    // TODO Auto-generated method stub
-    // TODO TEZAM Implement.
-    Map<String, List<FileSystem.Statistics>> map = new
-        HashMap<String, List<FileSystem.Statistics>>();
-    for(Statistics stat: FileSystem.getAllStatistics()) {
-      String uriScheme = stat.getScheme();
-      if (map.containsKey(uriScheme)) {
-        List<FileSystem.Statistics> list = map.get(uriScheme);
-        list.add(stat);
-      } else {
-        List<FileSystem.Statistics> list = new ArrayList<FileSystem.Statistics>();
-        list.add(stat);
-        map.put(uriScheme, list);
-      }
-    }
-    for (Map.Entry<String, List<FileSystem.Statistics>> entry: map.entrySet()) {
-      FileSystemStatisticUpdater updater = statisticUpdaters.get(entry.getKey());
-      if(updater==null) {//new FileSystem has been found in the cache
-        updater =
-            new FileSystemStatisticUpdater(counters, entry.getValue(),
-                entry.getKey());
-        statisticUpdaters.put(entry.getKey(), updater);
-      }
-      updater.updateCounters();
-    }
-
-    gcUpdater.incrementGcCounter();
-    updateResourceCounters();
-  }
-
-  /**
-   * Updates the {@link TaskCounter#COMMITTED_HEAP_BYTES} counter to reflect the
-   * current total committed heap space usage of this JVM.
-   */
-  private void updateHeapUsageCounter() {
-    long currentHeapUsage = Runtime.getRuntime().totalMemory();
-    counters.findCounter(TaskCounter.COMMITTED_HEAP_BYTES)
-            .setValue(currentHeapUsage);
-  }
-
-  /**
-   * Update resource information counters
-   */
-  void updateResourceCounters() {
-    // Update generic resource counters
-    updateHeapUsageCounter();
-
-    // Updating resources specified in ResourceCalculatorPlugin
-    if (pTree == null) {
-      return;
-    }
-    pTree.updateProcessTree();
-    long cpuTime = pTree.getCumulativeCpuTime();
-    long pMem = pTree.getCumulativeRssmem();
-    long vMem = pTree.getCumulativeVmem();
-    // Remove the CPU time consumed previously by JVM reuse
-    cpuTime -= initCpuCumulativeTime;
-    counters.findCounter(TaskCounter.CPU_MILLISECONDS).setValue(cpuTime);
-    counters.findCounter(TaskCounter.PHYSICAL_MEMORY_BYTES).setValue(pMem);
-    counters.findCounter(TaskCounter.VIRTUAL_MEMORY_BYTES).setValue(vMem);
-  }
-
 
   public static String normalizeStatus(String status, Configuration conf) {
     // Check to see if the status string is too long
@@ -661,7 +556,9 @@ public abstract class MRTask {
     statusUpdate();
     LOG.info("Runnning cleanup for the task");
     // do the cleanup
-    committer.abortTask(taskAttemptContext);
+    if (output instanceof MROutputLegacy) {
+      ((MROutputLegacy) output).abort();
+    }
   }
 
   public void localizeConfiguration(JobConf jobConf)
@@ -671,11 +568,19 @@ public abstract class MRTask {
     jobConf.setInt(JobContext.TASK_PARTITION,
         taskAttemptId.getTaskID().getId());
     jobConf.set(JobContext.ID, taskAttemptId.getJobID().toString());
+    
+    jobConf.setBoolean(MRJobConfig.TASK_ISMAP, isMap);
+    
+    Path outputPath = FileOutputFormat.getOutputPath(jobConf);
+    if (outputPath != null) {
+      if ((committer instanceof FileOutputCommitter)) {
+        FileOutputFormat.setWorkOutputPath(jobConf, 
+          ((FileOutputCommitter)committer).getTaskAttemptPath(taskAttemptContext));
+      } else {
+        FileOutputFormat.setWorkOutputPath(jobConf, outputPath);
+      }
+    }
   }
-
-  public abstract TezCounter getOutputRecordsCounter();
-
-  public abstract TezCounter getInputRecordsCounter();
 
   public org.apache.hadoop.mapreduce.TaskAttemptContext getTaskAttemptContext() {
     return taskAttemptContext;

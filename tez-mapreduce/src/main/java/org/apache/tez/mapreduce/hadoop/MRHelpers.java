@@ -19,6 +19,7 @@
 package org.apache.tez.mapreduce.hadoop;
 
 import java.io.DataOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.util.ArrayList;
@@ -49,24 +50,22 @@ import org.apache.hadoop.mapreduce.JobContext;
 import org.apache.hadoop.mapreduce.JobSubmissionFiles;
 import org.apache.hadoop.mapreduce.split.JobSplitWriter;
 import org.apache.hadoop.mapreduce.v2.proto.MRProtos;
-import org.apache.hadoop.mapreduce.v2.util.MRApps;
 import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.yarn.ContainerLogAppender;
-import org.apache.hadoop.yarn.api.ApplicationConstants;
 import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
 import org.apache.hadoop.yarn.api.records.LocalResource;
 import org.apache.hadoop.yarn.api.records.LocalResourceType;
 import org.apache.hadoop.yarn.api.records.LocalResourceVisibility;
 import org.apache.hadoop.yarn.api.records.Resource;
-import org.apache.hadoop.yarn.conf.YarnConfiguration;
-import org.apache.hadoop.yarn.util.Apps;
 import org.apache.hadoop.yarn.util.ConverterUtils;
+import org.apache.tez.client.TezClientUtils;
 import org.apache.tez.common.TezJobConfig;
 import org.apache.tez.common.TezUtils;
+import org.apache.tez.common.TezYARNUtils;
+import org.apache.tez.common.security.TokenCache;
 import org.apache.tez.dag.api.InputDescriptor;
 import org.apache.tez.dag.api.OutputDescriptor;
-import org.apache.tez.dag.api.TezConfiguration;
 import org.apache.tez.dag.api.TezUncheckedException;
 import org.apache.tez.dag.api.Vertex;
 import org.apache.tez.dag.api.VertexLocationHint.TaskLocationHint;
@@ -74,13 +73,16 @@ import org.apache.tez.mapreduce.combine.MRCombiner;
 import org.apache.tez.mapreduce.committer.MROutputCommitter;
 import org.apache.tez.mapreduce.input.MRInputLegacy;
 import org.apache.tez.mapreduce.output.MROutput;
+import org.apache.tez.mapreduce.output.MROutputLegacy;
 import org.apache.tez.mapreduce.partition.MRPartitioner;
 import org.apache.tez.mapreduce.protos.MRRuntimeProtos.MRInputUserPayloadProto;
 import org.apache.tez.mapreduce.protos.MRRuntimeProtos.MRSplitProto;
 import org.apache.tez.mapreduce.protos.MRRuntimeProtos.MRSplitsProto;
 import org.apache.tez.runtime.api.TezRootInputInitializer;
 
+import com.google.common.base.Function;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.protobuf.ByteString;
 
@@ -368,34 +370,21 @@ public class MRHelpers {
       Job job = Job.getInstance(conf);
       org.apache.hadoop.mapreduce.InputSplit[] splits = 
           generateNewSplits(job, null, 0);
-      splitInfoMem = createSplitsProto(splits, new SerializationFactory(job.getConfiguration()), job.getCredentials());
+      splitInfoMem = new InputSplitInfoMem(splits, createTaskLocationHintsFromSplits(splits),
+          splits.length, job.getCredentials(), job.getConfiguration());
     } else {
       LOG.info("Generating mapred api input splits");
       org.apache.hadoop.mapred.InputSplit[] splits = 
           generateOldSplits(jobConf, null, 0);
-      splitInfoMem = createSplitsProto(splits, jobConf.getCredentials());
+      splitInfoMem = new InputSplitInfoMem(splits, createTaskLocationHintsFromSplits(splits),
+          splits.length, jobConf.getCredentials(), jobConf);
     }
     LOG.info("NumSplits: " + splitInfoMem.getNumTasks() + ", SerializedSize: "
         + splitInfoMem.getSplitsProto().getSerializedSize());
     return splitInfoMem;
   }
 
-  private static InputSplitInfoMem createSplitsProto(
-      org.apache.hadoop.mapreduce.InputSplit[] newSplits,
-      SerializationFactory serializationFactory, Credentials credentials) throws IOException,
-      InterruptedException {
-    MRSplitsProto.Builder splitsBuilder = MRSplitsProto.newBuilder();
-
-    List<TaskLocationHint> locationHints = Lists
-        .newArrayListWithCapacity(newSplits.length);
-    for (org.apache.hadoop.mapreduce.InputSplit newSplit : newSplits) {
-      splitsBuilder.addSplits(createSplitProto(newSplit, serializationFactory));
-      locationHints.add(new TaskLocationHint(new HashSet<String>(Arrays
-          .asList(newSplit.getLocations())), null));
-    }
-    return new InputSplitInfoMem(splitsBuilder.build(), locationHints,
-        newSplits.length, credentials);
-  }
+  
 
   @Private
   public static <T extends org.apache.hadoop.mapreduce.InputSplit> MRSplitProto createSplitProto(
@@ -418,21 +407,6 @@ public class MRHelpers {
     builder.setSplitBytes(splitBs);
 
     return builder.build();
-  }
-
-  private static InputSplitInfoMem createSplitsProto(
-      org.apache.hadoop.mapred.InputSplit[] oldSplits, Credentials credentials) throws IOException {
-    MRSplitsProto.Builder splitsBuilder = MRSplitsProto.newBuilder();
-
-    List<TaskLocationHint> locationHints = Lists
-        .newArrayListWithCapacity(oldSplits.length);
-    for (org.apache.hadoop.mapred.InputSplit oldSplit : oldSplits) {
-      splitsBuilder.addSplits(createSplitProto(oldSplit));
-      locationHints.add(new TaskLocationHint(new HashSet<String>(Arrays
-          .asList(oldSplit.getLocations())), null));
-    }
-    return new InputSplitInfoMem(splitsBuilder.build(), locationHints,
-        oldSplits.length, credentials);
   }
 
   @Private
@@ -487,12 +461,7 @@ public class MRHelpers {
    */
   public static void addLog4jSystemProperties(String logLevel,
       List<String> vargs) {
-    vargs.add("-Dlog4j.configuration="
-        + TezConfiguration.TEZ_CONTAINER_LOG4J_PROPERTIES_FILE);
-    vargs.add("-D" + YarnConfiguration.YARN_APP_CONTAINER_LOG_DIR + "="
-        + ApplicationConstants.LOG_DIR_EXPANSION_VAR);
-    vargs.add("-D" + TezConfiguration.TEZ_ROOT_LOGGER_NAME + "=" + logLevel
-        + "," + TezConfiguration.TEZ_CONTAINER_LOGGER_NAME);
+    TezClientUtils.addLog4jSystemProperties(logLevel, vargs);
   }
 
   /**
@@ -729,38 +698,6 @@ public class MRHelpers {
         null, inputFormatName);    
   }
 
-  /**
-   * Called to specify that grouping of input splits be performed by Tez
-   * The configurationBytes conf should have the input format class configuration 
-   * set to the TezGroupedSplitsInputFormat. The real input format class name 
-   * should be passed as an argument to this method.
-   */
-  public static byte[] createMRInputPayloadWithGrouping(byte[] configurationBytes,
-      MRSplitsProto mrSplitsProto, String inputFormatName) throws IOException {
-    Preconditions.checkArgument(configurationBytes != null,
-        "Configuration bytes must be specified");
-    Preconditions.checkArgument(inputFormatName != null, 
-        "InputFormat must be specified");
-    return createMRInputPayload(ByteString
-        .copyFrom(configurationBytes), mrSplitsProto, inputFormatName);    
-  }
-
-  /**
-   * Called to specify that grouping of input splits be performed by Tez
-   * The conf should have the input format class configuration 
-   * set to the TezGroupedSplitsInputFormat. The real input format class name 
-   * should be passed as an argument to this method.
-   */
-  public static byte[] createMRInputPayloadWithGrouping(Configuration conf,
-      MRSplitsProto mrSplitsProto, String inputFormatName) throws IOException {
-    Preconditions
-        .checkArgument(conf != null, "Configuration must be specified");
-    Preconditions.checkArgument(inputFormatName != null, 
-        "InputFormat must be specified");
-    return createMRInputPayload(createByteStringFromConf(conf), 
-        mrSplitsProto, inputFormatName);    
-  }
-
   private static byte[] createMRInputPayload(ByteString bytes, 
       MRSplitsProto mrSplitsProto, String inputFormatName) throws IOException {
     MRInputUserPayloadProto.Builder userPayloadBuilder = MRInputUserPayloadProto
@@ -877,19 +814,20 @@ public class MRHelpers {
         MRJobConfig.MAPRED_ADMIN_USER_SHELL, MRJobConfig.DEFAULT_SHELL));
 
     // Add pwd to LD_LIBRARY_PATH, add this before adding anything else
-    Apps.addToEnvironment(environment, Environment.LD_LIBRARY_PATH.name(),
-        Environment.PWD.$());
+    TezYARNUtils.addToEnvironment(environment, Environment.LD_LIBRARY_PATH.name(),
+        Environment.PWD.$(), File.pathSeparator);
 
     // Add the env variables passed by the admin
-    Apps.setEnvFromInputString(environment, conf.get(
+    TezYARNUtils.setEnvFromInputString(environment, conf.get(
         MRJobConfig.MAPRED_ADMIN_USER_ENV,
-        MRJobConfig.DEFAULT_MAPRED_ADMIN_USER_ENV));
+        MRJobConfig.DEFAULT_MAPRED_ADMIN_USER_ENV),
+        File.pathSeparator);
 
     // Add the env variables passed by the user
     String mapredChildEnv = (isMap ?
         conf.get(MRJobConfig.MAP_ENV, "")
         : conf.get(MRJobConfig.REDUCE_ENV, ""));
-    Apps.setEnvFromInputString(environment, mapredChildEnv);
+    TezYARNUtils.setEnvFromInputString(environment, mapredChildEnv, File.pathSeparator);
 
     // Set logging level in the environment.
     environment.put(
@@ -927,12 +865,11 @@ public class MRHelpers {
    * @param conf Configuration from which to extract information
    * @param environment Environment map to update
    */
-  public static void updateEnvironmentForMRAM(Configuration conf,
-      Map<String, String> environment) {
-    MRApps.setEnvFromInputString(environment,
-        conf.get(MRJobConfig.MR_AM_ADMIN_USER_ENV));
-    MRApps.setEnvFromInputString(environment,
-        conf.get(MRJobConfig.MR_AM_ENV));
+  public static void updateEnvironmentForMRAM(Configuration conf, Map<String, String> environment) {
+    TezYARNUtils.setEnvFromInputString(environment, conf.get(MRJobConfig.MR_AM_ADMIN_USER_ENV),
+        File.pathSeparator);
+    TezYARNUtils.setEnvFromInputString(environment, conf.get(MRJobConfig.MR_AM_ENV),
+        File.pathSeparator);
   }
 
   /**
@@ -984,7 +921,14 @@ public class MRHelpers {
         .setUserPayload(userPayload);
     vertex.addOutput("MROutput", od, MROutputCommitter.class);
   }
-  
+
+  @Private
+  public static void addMROutputLegacy(Vertex vertex, byte[] userPayload) {
+    OutputDescriptor od = new OutputDescriptor(MROutputLegacy.class.getName())
+        .setUserPayload(userPayload);
+    vertex.addOutput("MROutput", od, MROutputCommitter.class);
+  }
+
   @SuppressWarnings("unchecked")
   public static InputSplit createOldFormatSplitFromUserPayload(
       MRSplitProto splitProto, SerializationFactory serializationFactory)
@@ -1032,4 +976,62 @@ public class MRHelpers {
     deserializer.close();
     return inputSplit;
   }
+
+  private static List<TaskLocationHint> createTaskLocationHintsFromSplits(
+      org.apache.hadoop.mapreduce.InputSplit[] newFormatSplits) {
+    Iterable<TaskLocationHint> iterable = Iterables.transform(Arrays.asList(newFormatSplits),
+        new Function<org.apache.hadoop.mapreduce.InputSplit, TaskLocationHint>() {
+          @Override
+          public TaskLocationHint apply(org.apache.hadoop.mapreduce.InputSplit input) {
+            try {
+              return new TaskLocationHint(new HashSet<String>(Arrays.asList(input.getLocations())),
+                  null);
+            } catch (IOException e) {
+              throw new RuntimeException(e);
+            } catch (InterruptedException e) {
+              throw new RuntimeException(e);
+            }
+          }
+        });
+    return Lists.newArrayList(iterable);
+  }
+
+  private static List<TaskLocationHint> createTaskLocationHintsFromSplits(
+      org.apache.hadoop.mapred.InputSplit[] oldFormatSplits) {
+    Iterable<TaskLocationHint> iterable = Iterables.transform(Arrays.asList(oldFormatSplits),
+        new Function<org.apache.hadoop.mapred.InputSplit, TaskLocationHint>() {
+          @Override
+          public TaskLocationHint apply(org.apache.hadoop.mapred.InputSplit input) {
+            try {
+              return new TaskLocationHint(new HashSet<String>(Arrays.asList(input.getLocations())),
+                  null);
+            } catch (IOException e) {
+              throw new RuntimeException(e);
+            }
+          }
+        });
+
+    return Lists.newArrayList(iterable);
+  }
+
+  /**
+   * Merge tokens from a configured binary file into provided Credentials object.
+   * Uses "mapreduce.job.credentials.binary" property to find location of token file.
+   * @param creds Credentials object to add new tokens to
+   * @param conf Configuration containing location of token file.
+   * 
+   * TezClient reads credentials from the property - TezJobConfig.TEZ_CREDENTIALS_PATH. This method
+   * is not required if that property is set.
+   * 
+   * @throws IOException
+   */
+  public static void mergeMRBinaryTokens(Credentials creds,
+      Configuration conf) throws IOException {
+    String tokenFilePath = conf.get(MRJobConfig.MAPREDUCE_JOB_CREDENTIALS_BINARY);
+    if (tokenFilePath == null || tokenFilePath.isEmpty()) {
+      return;
+    }
+    TokenCache.mergeBinaryTokens(creds, conf, tokenFilePath);
+  }
+
 }

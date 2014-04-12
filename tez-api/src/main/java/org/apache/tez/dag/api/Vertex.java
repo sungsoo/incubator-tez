@@ -20,16 +20,21 @@ package org.apache.tez.dag.api;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 import org.apache.hadoop.yarn.api.records.LocalResource;
 import org.apache.hadoop.yarn.api.records.Resource;
+import org.apache.tez.dag.api.VertexGroup.GroupInfo;
 import org.apache.tez.dag.api.VertexLocationHint.TaskLocationHint;
 import org.apache.tez.runtime.api.LogicalIOProcessor;
 import org.apache.tez.runtime.api.OutputCommitter;
 import org.apache.tez.runtime.api.TezRootInputInitializer;
 import org.apache.tez.runtime.api.events.RootInputDataInformationEvent;
+
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Maps;
 
 public class Vertex {
 
@@ -39,8 +44,8 @@ public class Vertex {
   private final int parallelism;
   private VertexLocationHint taskLocationsHint;
   private final Resource taskResource;
-  private Map<String, LocalResource> taskLocalResources;
-  private Map<String, String> taskEnvironment;
+  private Map<String, LocalResource> taskLocalResources = new HashMap<String, LocalResource>();
+  private Map<String, String> taskEnvironment = new HashMap<String, String>();
   private final List<RootInputLeafOutput<InputDescriptor>> additionalInputs 
                       = new ArrayList<RootInputLeafOutput<InputDescriptor>>();
   private final List<RootInputLeafOutput<OutputDescriptor>> additionalOutputs 
@@ -51,8 +56,9 @@ public class Vertex {
   private final List<Vertex> outputVertices = new ArrayList<Vertex>();
   private final List<String> inputEdgeIds = new ArrayList<String>();
   private final List<String> outputEdgeIds = new ArrayList<String>();
+  private final Map<String, GroupInfo> groupInputs = Maps.newHashMap();
+  
   private String javaOpts = "";
-
 
   public Vertex(String vertexName,
       ProcessorDescriptor processorDescriptor,
@@ -92,8 +98,9 @@ public class Vertex {
     if (locations == null) {
       return this;
     }
-    assert locations.size() == parallelism;
-    taskLocationsHint = new VertexLocationHint(parallelism, locations);
+    Preconditions.checkArgument((locations.size() == parallelism), 
+        "Locations array length must match the parallelism set for the vertex");
+    taskLocationsHint = new VertexLocationHint(locations);
     return this;
   }
 
@@ -103,7 +110,11 @@ public class Vertex {
   }
 
   public Vertex setTaskLocalResources(Map<String, LocalResource> localResources) {
-    this.taskLocalResources = localResources;
+    if (localResources == null) {
+      this.taskLocalResources = new HashMap<String, LocalResource>();
+    } else {
+      this.taskLocalResources = localResources;
+    }
     return this;
   }
 
@@ -112,7 +123,12 @@ public class Vertex {
   }
 
   public Vertex setTaskEnvironment(Map<String, String> environment) {
-    this.taskEnvironment = environment;
+    if (environment == null) {
+      this.taskEnvironment = new HashMap<String, String>();
+    }
+    else {
+      this.taskEnvironment = environment;
+    }
     return this;
   }
 
@@ -150,7 +166,7 @@ public class Vertex {
    *          each of it's tasks. </p> If a {@link TezRootInputInitializer} is
    *          meant to determine the parallelism of the vertex, the initial
    *          vertex parallelism should be set to -1.
-   * @return
+   * @return this Vertex
    */
   public Vertex addInput(String inputName, InputDescriptor inputDescriptor,
       Class<? extends TezRootInputInitializer> inputInitializer) {
@@ -180,12 +196,17 @@ public class Vertex {
    * @param outputDescriptor
    * @param outputCommitterClazz Class to be used for the OutputCommitter.
    *                             Can be null.
-   * @return
+   * @return this Vertex
    */
   public Vertex addOutput(String outputName, OutputDescriptor outputDescriptor,
       Class<? extends OutputCommitter> outputCommitterClazz) {
     additionalOutputs.add(new RootInputLeafOutput<OutputDescriptor>(outputName,
         outputDescriptor, outputCommitterClazz));
+    return this;
+  }
+  
+  Vertex addAdditionalOutput(RootInputLeafOutput<OutputDescriptor> output) {
+    additionalOutputs.add(output);
     return this;
   }
 
@@ -199,7 +220,7 @@ public class Vertex {
    * user defined code embedded in the plugin
    * 
    * @param vertexManagerPluginDescriptor
-   * @return Vertex
+   * @return this Vertex
    */
   public Vertex setVertexManagerPlugin(
       VertexManagerPluginDescriptor vertexManagerPluginDescriptor) {
@@ -220,16 +241,28 @@ public class Vertex {
     return vertexManagerPlugin;
   }
 
-  void addInputVertex(Vertex inputVertex, String edgeId) {
+  Map<String, GroupInfo> getGroupInputs() {
+    return groupInputs;
+  }
+  
+  void addGroupInput(String groupName, GroupInfo groupInputInfo) {
+    if (groupInputs.put(groupName, groupInputInfo) != null) {
+      throw new IllegalStateException(
+          "Vertex: " + getVertexName() + 
+          " already has group input with name:" + groupName);
+    }
+  }
+
+  void addInputVertex(Vertex inputVertex, Edge edge) {
     inputVertices.add(inputVertex);
-    inputEdgeIds.add(edgeId);
+    inputEdgeIds.add(edge.getId());
   }
 
-  void addOutputVertex(Vertex outputVertex, String edgeId) {
+  void addOutputVertex(Vertex outputVertex, Edge edge) {
     outputVertices.add(outputVertex);
-    outputEdgeIds.add(edgeId);
+    outputEdgeIds.add(edge.getId());
   }
-
+  
   public List<Vertex> getInputVertices() {
     return Collections.unmodifiableList(inputVertices);
   }

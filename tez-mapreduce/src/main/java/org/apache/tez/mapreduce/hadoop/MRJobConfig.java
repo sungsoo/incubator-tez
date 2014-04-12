@@ -79,11 +79,6 @@ public interface MRJobConfig {
 
   public static final String SKIP_OUTDIR = "mapreduce.job.skip.outdir";
 
-  public static final String SPECULATIVE_SLOWNODE_THRESHOLD = "mapreduce.job.speculative.slownodethreshold";
-
-  public static final String SPECULATIVE_SLOWTASK_THRESHOLD = "mapreduce.job.speculative.slowtaskthreshold";
-
-  public static final String SPECULATIVECAP = "mapreduce.job.speculative.speculativecap";
 
   public static final String JOB_LOCAL_DIR = "mapreduce.job.local.dir";
 
@@ -201,8 +196,6 @@ public interface MRJobConfig {
 
   public static final String MAP_DEBUG_SCRIPT = "mapreduce.map.debug.script";
 
-  public static final String MAP_SPECULATIVE = "mapreduce.map.speculative";
-
   public static final String MAP_FAILURES_MAX_PERCENT = "mapreduce.map.failures.maxpercent";
 
   public static final String MAP_SKIP_INCR_PROC_COUNT = "mapreduce.map.skip.proc-count.auto-incr";
@@ -265,8 +258,6 @@ public interface MRJobConfig {
   public static final String SHUFFLE_PARALLEL_COPIES = "mapreduce.reduce.shuffle.parallelcopies";
 
   public static final String REDUCE_DEBUG_SCRIPT = "mapreduce.reduce.debug.script";
-
-  public static final String REDUCE_SPECULATIVE = "mapreduce.reduce.speculative";
 
   public static final String SHUFFLE_CONNECT_TIMEOUT = "mapreduce.reduce.shuffle.connect.timeout";
 
@@ -442,10 +433,6 @@ public interface MRJobConfig {
     MR_AM_PREFIX  + "job.reduce.rampup.limit";
   public static final float DEFAULT_MR_AM_JOB_REDUCE_RAMP_UP_LIMIT = 0.5f;
 
-  /** The class that should be used for speculative execution calculations.*/
-  public static final String MR_AM_JOB_SPECULATOR =
-    MR_AM_PREFIX + "job.speculator.class";
-
   /** Class used to estimate task resource needs.*/
   public static final String MR_AM_TASK_ESTIMATOR =
     MR_AM_PREFIX + "job.task.estimator.class";
@@ -583,27 +570,6 @@ public interface MRJobConfig {
   public static final String APPLICATION_ATTEMPT_ID =
       "mapreduce.job.application.attempt.id";
 
-  /**
-   * Job end notification.
-   */
-  public static final String MR_JOB_END_NOTIFICATION_URL =
-    "mapreduce.job.end-notification.url";
-
-  public static final String MR_JOB_END_NOTIFICATION_PROXY =
-    "mapreduce.job.end-notification.proxy";
-
-  public static final String MR_JOB_END_RETRY_ATTEMPTS =
-    "mapreduce.job.end-notification.retry.attempts";
-
-  public static final String MR_JOB_END_RETRY_INTERVAL =
-    "mapreduce.job.end-notification.retry.interval";
-
-  public static final String MR_JOB_END_NOTIFICATION_MAX_ATTEMPTS =
-    "mapreduce.job.end-notification.max.attempts";
-
-  public static final String MR_JOB_END_NOTIFICATION_MAX_RETRY_INTERVAL =
-    "mapreduce.job.end-notification.max.retry.interval";
-
   /*
    * MR AM Service Authorization
    */
@@ -637,6 +603,9 @@ public interface MRJobConfig {
   @InterfaceAudience.Private
   static final String HS_DELEGATION_TOKEN_REQUIRED
       = "mapreduce.history.server.delegationtoken.required";
+  
+  public static final String MROUTPUT_FILE_NAME_PREFIX
+      = MR_TEZ_PREFIX + "mroutput.file-name.prefix";
 
   // MRR related config properties
 
@@ -655,4 +624,8 @@ public interface MRJobConfig {
   public static final String MR_TEZ_SPLITS_VIA_EVENTS = MR_TEZ_PREFIX + "splits.via.events";
   public static final boolean MR_TEZ_SPLITS_VIA_EVENTS_DEFAULT = true;
 
+  public static final String MR_TEZ_INPUT_INITIALIZER_SERIALIZE_EVENT_PAYLOAD = MR_TEZ_PREFIX
+      + "input.initializer.serialize.event.payload";
+  public static final boolean MR_TEZ_INPUT_INITIALIZER_SERIALIZE_EVENT_PAYLOAD_DEFAULT = true;
+  
 }

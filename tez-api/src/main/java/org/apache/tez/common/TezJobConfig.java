@@ -19,11 +19,12 @@ package org.apache.tez.common;
 
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.classification.InterfaceStability.Evolving;
+import org.apache.hadoop.classification.InterfaceStability.Unstable;
+import org.apache.tez.dag.api.TezConfiguration;
 
 
 /**
- * Meant for user configurable job properties. For others look at {@link Constants}
- *
+ * Meant for user configurable job properties.
  */
 
 // TODO EVENTUALLY A description for each property.
@@ -32,6 +33,7 @@ import org.apache.hadoop.classification.InterfaceStability.Evolving;
 public class TezJobConfig {
 
 
+  public static final String TEZ_TASK_PREFIX = TezConfiguration.TEZ_TASK_PREFIX;
 
 
   /** The number of milliseconds between progress reports. */
@@ -146,7 +148,7 @@ public class TezJobConfig {
    * 
    */
   public static final String COUNTERS_MAX_KEY = "tez.runtime.job.counters.max";
-  public static final int COUNTERS_MAX_DEFAULT = 120;
+  public static final int COUNTERS_MAX_DEFAULT = 1200;
 
   /**
    * 
@@ -164,7 +166,7 @@ public class TezJobConfig {
    * 
    */
   public static final String COUNTER_GROUPS_MAX_KEY = "tez.runtime.job.counters.groups.max";
-  public static final int COUNTER_GROUPS_MAX_DEFAULT = 50;
+  public static final int COUNTER_GROUPS_MAX_DEFAULT = 500;
 
   
   /**
@@ -195,7 +197,16 @@ public class TezJobConfig {
    */
   public static final String TEZ_RUNTIME_SHUFFLE_FETCH_FAILURES = 
       "tez.runtime.shuffle.fetch.failures.limit";
-  public final static int DEFAULT_TEZ_RUNTIME_SHUFFLE_FETCH_FAILURES_LIMIT = 10;
+  public final static int DEFAULT_TEZ_RUNTIME_SHUFFLE_FETCH_FAILURES_LIMIT = 5;
+
+
+  /**
+   *
+   */
+  public static final String TEZ_RUNTIME_SHUFFLE_FETCH_MAX_TASK_OUTPUT_AT_ONCE =
+    "tez.runtime.shuffle.fetch.max.task.output.at.once";
+  public final static int DEFAULT_TEZ_RUNTIME_SHUFFLE_FETCH_MAX_TASK_OUTPUT_AT_ONCE
+          = 20;
 
   /**
    * 
@@ -218,6 +229,13 @@ public class TezJobConfig {
   public static final String TEZ_RUNTIME_SHUFFLE_READ_TIMEOUT = "tez.runtime.shuffle.read.timeout";
   public final static int DEFAULT_TEZ_RUNTIME_SHUFFLE_READ_TIMEOUT = 
       3 * 60 * 1000;
+  
+  /**
+   * 
+   */
+  public static final String TEZ_RUNTIME_SHUFFLE_BUFFER_SIZE = "tez.runtime.shuffle.buffersize";
+  public final static int DEFAULT_TEZ_RUNTIME_SHUFFLE_BUFFER_SIZE = 
+      8 * 1024;
 
   /**
    * 
@@ -248,7 +266,7 @@ public class TezJobConfig {
   public static final String TEZ_RUNTIME_SHUFFLE_MERGE_PERCENT = 
       "tez.runtime.shuffle.merge.percent";
   public static final float DEFAULT_TEZ_RUNTIME_SHUFFLE_MERGE_PERCENT = 0.90f;
-  
+
   /**
    * TODO TEZAM3 default value ?
    */
@@ -292,30 +310,92 @@ public class TezJobConfig {
       "tez.runtime.intermediate-output.value.class";
   public static final String TEZ_RUNTIME_INTERMEDIATE_INPUT_VALUE_CLASS = 
       "tez.runtime.intermediate-input.value.class";
-  
+
+
+  /** Whether intermediate output should be compressed or not */
   public static final String TEZ_RUNTIME_INTERMEDIATE_OUTPUT_SHOULD_COMPRESS = 
       "tez.runtime.intermediate-output.should-compress";
+  /** Whether intermediate input is compressed */
   public static final String TEZ_RUNTIME_INTERMEDIATE_INPUT_IS_COMPRESSED = 
       "tez.runtime.intermediate-input.is-compressed";
-  
+  /**
+   * The coded to be used if compressing intermediate output. Only applicable if
+   * tez.runtime.intermediate-output.should-compress is enabled.
+   */
   public static final String TEZ_RUNTIME_INTERMEDIATE_OUTPUT_COMPRESS_CODEC = 
       "tez.runtime.intermediate-output.compress.codec";
+  /**
+   * The coded to be used when reading intermediate compressed input. Only
+   * applicable if tez.runtime.intermediate-input.is-compressed is enabled.
+   */
   public static final String TEZ_RUNTIME_INTERMEDIATE_INPUT_COMPRESS_CODEC = 
       "tez.runtime.intermediate-input.compress.codec";
 
+
   public static final String TEZ_RUNTIME_INTERMEDIATE_INPUT_KEY_SECONDARY_COMPARATOR_CLASS = 
       "tez.runtime.intermediate-input.key.secondary.comparator.class";
-  
-  // TODO This should be in DAGConfiguration
-  /* config for tracking the local file where all the credentials for the job
-   * credentials.
-   */
-  public static final String DAG_CREDENTIALS_BINARY =  "tez.dag.credentials.binary";
-  
+
+  public static final String TEZ_RUNTIME_EMPTY_PARTITION_INFO_VIA_EVENTS_ENABLED =
+      "tez.runtime.empty.partitions.info-via-events.enabled";
+  public static final boolean TEZ_RUNTIME_EMPTY_PARTITION_INFO_VIA_EVENTS_ENABLED_DEFAULT = true;
+
   public static final String TEZ_RUNTIME_BROADCAST_DATA_VIA_EVENTS_ENABLED = "tez.runtime.broadcast.data-via-events.enabled";
   public static final boolean TEZ_RUNTIME_BROADCAST_DATA_VIA_EVENTS_ENABLED_DEFAULT = false;
   
   public static final String TEZ_RUNTIME_BROADCAST_DATA_VIA_EVENTS_MAX_SIZE = "tez.runtime.broadcast.data-via-events.max-size";
   public static final int TEZ_RUNTIME_BROADCAST_DATA_VIA_EVENTS_MAX_SIZE_DEFAULT = 200 << 10;// 200KB
   
+  /** Defines the ProcessTree implementation which will be used to collect resource utilization. */
+  public static final String TEZ_RESOURCE_CALCULATOR_PROCESS_TREE_CLASS = "tez.resource.calculator.process-tree.class";
+
+  /**
+   * Whether to scale down memory requested by each component if the total
+   * exceeds the available JVM memory
+   */
+  @Private @Unstable
+  public static final String TEZ_TASK_SCALE_MEMORY_ENABLED = TEZ_TASK_PREFIX
+      + "scale.memory.enabled";
+  public static final boolean TEZ_TASK_SCALE_MEMORY_ENABLED_DEFAULT = true;
+  
+  /**
+   * The allocator to use for initial memory allocation
+   */
+  @Private @Unstable
+  public static final String TEZ_TASK_SCALE_MEMORY_ALLOCATOR_CLASS = TEZ_TASK_PREFIX
+      + "scale.memory.allocator.class";
+  public static final String TEZ_TASK_SCALE_MEMORY_ALLOCATOR_CLASS_DEFAULT = "org.apache.tez.runtime.common.resources.ScalingAllocator";
+  
+  /**
+   * The fraction of the JVM memory which will not be considered for allocation.
+   * No defaults, since there are pre-existing defaults based on different scenarios.
+   */
+  @Private @Unstable
+  public static final String TEZ_TASK_SCALE_MEMORY_RESERVE_FRACTION = TEZ_TASK_PREFIX
+      + "scale.memory.reserve-fraction";
+
+  /**
+   * Fraction of available memory to reserve per input/output. This amount is
+   * removed from the total available pool before allocation and is for factoring in overheads.
+   */
+  @Private @Unstable
+  public static final String TEZ_TASK_SCALE_MEMORY_ADDITIONAL_RESERVATION_FRACTION_PER_IO = TEZ_TASK_PREFIX
+      + "scale.memory.additional.reservation.fraction.per-io";
+
+  /**
+   * Max cumulative total reservation for additional IOs.
+   */
+  public static final String TEZ_TASK_SCALE_MEMORY_ADDITIONAL_RESERVATION_FRACTION_MAX = TEZ_TASK_PREFIX
+      + "scale.memory.additional reservation.fraction.max";
+  /*
+   * Weighted ratios for individual component types in the RuntimeLibrary.
+   * e.g. PARTITIONED_UNSORTED_OUTPUT:0,UNSORTED_INPUT:1,SORTED_OUTPUT:2,SORTED_MERGED_INPUT:3,PROCESSOR:1,OTHER:1
+   */
+  @Private @Unstable
+  public static final String TEZ_TASK_SCALE_MEMORY_WEIGHTED_RATIOS = TEZ_TASK_PREFIX
+      + "initial.memory.scale.ratios";
+  
+  /**
+   * Path to a credentials file located on the local file system with serialized credentials
+   */
+  public static final String TEZ_CREDENTIALS_PATH = "tez.credentials.path";
 }

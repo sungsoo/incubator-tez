@@ -18,13 +18,19 @@
 
 package org.apache.tez.dag.app;
 
+import static com.google.common.base.Preconditions.checkNotNull;
+
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.PrintWriter;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URL;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -32,14 +38,16 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.GnuParser;
@@ -49,7 +57,6 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.Text;
 import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
 import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.security.UserGroupInformation;
@@ -77,9 +84,14 @@ import org.apache.hadoop.yarn.security.AMRMTokenIdentifier;
 import org.apache.hadoop.yarn.util.Clock;
 import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.util.SystemClock;
+import org.apache.tez.client.PreWarmContext;
 import org.apache.tez.client.TezSessionStatus;
+import org.apache.tez.common.TezConverterUtils;
 import org.apache.tez.common.TezUtils;
+import org.apache.tez.common.counters.Limits;
+import org.apache.tez.common.impl.LogUtils;
 import org.apache.tez.common.security.JobTokenIdentifier;
+import org.apache.tez.common.security.TokenCache;
 import org.apache.tez.dag.api.DagTypeConverters;
 import org.apache.tez.dag.api.TezConfiguration;
 import org.apache.tez.dag.api.TezConstants;
@@ -94,14 +106,18 @@ import org.apache.tez.dag.api.records.DAGProtos.DAGPlan;
 import org.apache.tez.dag.api.records.DAGProtos.PlanKeyValuePair;
 import org.apache.tez.dag.api.records.DAGProtos.PlanLocalResourcesProto;
 import org.apache.tez.dag.api.records.DAGProtos.VertexPlan;
+import org.apache.tez.dag.app.RecoveryParser.RecoveredDAGData;
 import org.apache.tez.dag.app.dag.DAG;
 import org.apache.tez.dag.app.dag.DAGState;
 import org.apache.tez.dag.app.dag.Task;
 import org.apache.tez.dag.app.dag.TaskAttempt;
+import org.apache.tez.dag.app.dag.Vertex;
 import org.apache.tez.dag.app.dag.event.DAGAppMasterEvent;
 import org.apache.tez.dag.app.dag.event.DAGAppMasterEventDAGFinished;
 import org.apache.tez.dag.app.dag.event.DAGAppMasterEventType;
 import org.apache.tez.dag.app.dag.event.DAGEvent;
+import org.apache.tez.dag.app.dag.event.DAGEventRecoverEvent;
+import org.apache.tez.dag.app.dag.event.DAGEventStartDag;
 import org.apache.tez.dag.app.dag.event.DAGEventType;
 import org.apache.tez.dag.app.dag.event.TaskAttemptEvent;
 import org.apache.tez.dag.app.dag.event.TaskAttemptEventType;
@@ -123,13 +139,19 @@ import org.apache.tez.dag.app.rm.node.AMNodeEventType;
 import org.apache.tez.dag.app.rm.node.AMNodeMap;
 import org.apache.tez.dag.history.DAGHistoryEvent;
 import org.apache.tez.dag.history.HistoryEventHandler;
-import org.apache.tez.dag.history.avro.HistoryEventType;
+import org.apache.tez.dag.history.events.AMLaunchedEvent;
 import org.apache.tez.dag.history.events.AMStartedEvent;
+import org.apache.tez.dag.history.events.DAGSubmittedEvent;
+import org.apache.tez.dag.history.utils.DAGUtils;
 import org.apache.tez.dag.records.TezDAGID;
 import org.apache.tez.dag.utils.Graph;
-import org.apache.tez.runtime.library.common.security.JobTokenSecretManager;
+import org.apache.tez.dag.utils.RelocalizationUtils;
+import org.apache.tez.common.security.JobTokenSecretManager;
+import org.codehaus.jettison.json.JSONException;
+
 import com.google.common.annotations.VisibleForTesting;
-import org.apache.tez.runtime.library.common.security.TokenCache;
+import com.google.common.base.Function;
+import com.google.common.collect.Maps;
 
 /**
  * The Map-Reduce Application Master.
@@ -159,6 +181,8 @@ public class DAGAppMaster extends AbstractService {
    */
   public static final int SHUTDOWN_HOOK_PRIORITY = 30;
 
+  private static Pattern sanitizeLabelPattern = Pattern.compile("[:\\-\\W]+");
+
   private Clock clock;
   private final boolean isSession;
   private long appsStartTime;
@@ -187,6 +211,8 @@ public class DAGAppMaster extends AbstractService {
   private VertexEventDispatcher vertexEventDispatcher;
   private TaskSchedulerEventHandler taskSchedulerEventHandler;
   private HistoryEventHandler historyEventHandler;
+  private final Map<String, LocalResource> amResources = new HashMap<String, LocalResource>();
+  private final Map<String, LocalResource> cumulativeAdditionalResources = new HashMap<String, LocalResource>();
   private final Map<String, LocalResource> sessionResources =
     new HashMap<String, LocalResource>();
 
@@ -200,12 +226,18 @@ public class DAGAppMaster extends AbstractService {
 
   private DAG currentDAG;
   private Credentials amTokens = new Credentials(); // Filled during init
-  private UserGroupInformation currentUser; // Will be setup during init
+  private UserGroupInformation appMasterUgi;
 
   private AtomicBoolean sessionStopped = new AtomicBoolean(false);
   private long sessionTimeoutInterval;
   private long lastDAGCompletionTime;
   private Timer dagSubmissionTimer;
+  private boolean recoveryEnabled;
+  private Path recoveryDataDir;
+  private Path currentRecoveryDataDir;
+  private FileSystem recoveryFS;
+
+  protected boolean isLastAMRetry = false;
 
   // DAG Counter
   private final AtomicInteger dagCounter = new AtomicInteger();
@@ -249,14 +281,22 @@ public class DAGAppMaster extends AbstractService {
   @Override
   public synchronized void serviceInit(final Configuration conf) throws Exception {
 
+    int maxAppAttempts = 1;
+    String maxAppAttemptsEnv = System.getenv(
+        ApplicationConstants.MAX_APP_ATTEMPTS_ENV);
+    if (maxAppAttemptsEnv != null) {
+      maxAppAttempts = Integer.valueOf(maxAppAttemptsEnv);
+    }
+    isLastAMRetry = appAttemptID.getAttemptId() >= maxAppAttempts;
+
     this.amConf = conf;
     conf.setBoolean(Dispatcher.DISPATCHER_EXIT_ON_ERROR_KEY, true);
 
+    dispatcher = createDispatcher();
     context = new RunningAppContext(conf);
 
     clientHandler = new DAGClientHandler();
 
-    dispatcher = createDispatcher();
     addIfService(dispatcher, false);
 
     clientRpcServer = new DAGClientServer(clientHandler, appAttemptID);
@@ -268,17 +308,17 @@ public class DAGAppMaster extends AbstractService {
     containerHeartbeatHandler = createContainerHeartbeatHandler(context, conf);
     addIfService(containerHeartbeatHandler, true);
 
-    String sessionTokenUUID = UUID.randomUUID().toString();
-    JobTokenIdentifier identifier = new JobTokenIdentifier(new Text(
-        sessionTokenUUID));
-    sessionToken = new Token<JobTokenIdentifier>(identifier,
-        jobTokenSecretManager);
-    sessionToken.setService(identifier.getJobId());
-    TokenCache.setJobToken(sessionToken, amTokens);
+    sessionToken =
+        TokenCache.getSessionToken(amTokens);
+    if (sessionToken == null) {
+      throw new RuntimeException("Could not find session token in AM Credentials");
+    }
+
     // Prepare the TaskAttemptListener server for authentication of Containers
     // TaskAttemptListener gets the information via jobTokenSecretManager.
-    jobTokenSecretManager.addTokenForJob(sessionTokenUUID, sessionToken);
-    LOG.info("Adding session token to jobTokenSecretManager for sessionTokenUUID: " + sessionTokenUUID);
+    LOG.info("Adding session token to jobTokenSecretManager for application");
+    jobTokenSecretManager.addTokenForJob(
+        appAttemptID.getApplicationId().toString(), sessionToken);
 
     //service to handle requests to TaskUmbilicalProtocol
     taskAttemptListener = createTaskAttemptListener(context,
@@ -306,9 +346,16 @@ public class DAGAppMaster extends AbstractService {
     dispatcher.register(TaskAttemptEventType.class,
         new TaskAttemptEventDispatcher());
 
-    taskSchedulerEventHandler = new TaskSchedulerEventHandler(context,
+    this.taskSchedulerEventHandler = new TaskSchedulerEventHandler(context,
         clientRpcServer, dispatcher.getEventHandler(), containerSignatureMatcher);
     addIfService(taskSchedulerEventHandler, true);
+    if (isLastAMRetry) {
+      LOG.info("AM will unregister as this is the last attempt"
+          + ", currentAttempt=" + appAttemptID.getAttemptId()
+          + ", maxAttempts=" + maxAppAttempts);
+      this.taskSchedulerEventHandler.setShouldUnregisterFlag();
+    }
+
     dispatcher.register(AMSchedulerEventType.class,
         taskSchedulerEventHandler);
     addIfServiceDependency(taskSchedulerEventHandler, clientRpcServer);
@@ -319,21 +366,33 @@ public class DAGAppMaster extends AbstractService {
 
     historyEventHandler = new HistoryEventHandler(context);
     addIfService(historyEventHandler, true);
-    dispatcher.register(HistoryEventType.class, historyEventHandler);
 
     this.sessionTimeoutInterval = 1000 * amConf.getInt(
             TezConfiguration.TEZ_SESSION_AM_DAG_SUBMIT_TIMEOUT_SECS,
             TezConfiguration.TEZ_SESSION_AM_DAG_SUBMIT_TIMEOUT_SECS_DEFAULT);
+
+    recoveryDataDir = FileSystem.get(conf).makeQualified(new Path(
+        conf.get(TezConfiguration.TEZ_AM_STAGING_DIR,
+            TezConfiguration.TEZ_AM_STAGING_DIR_DEFAULT),
+              this.appAttemptID.getApplicationId().toString() +
+                  File.separator + TezConfiguration.DAG_RECOVERY_DATA_DIR_NAME));
+    currentRecoveryDataDir = new Path(recoveryDataDir,
+        Integer.toString(this.appAttemptID.getAttemptId()));
+    recoveryFS = FileSystem.get(recoveryDataDir.toUri(), conf);
 
     if (isSession) {
       FileInputStream sessionResourcesStream = null;
       try {
         sessionResourcesStream = new FileInputStream(
           TezConfiguration.TEZ_SESSION_LOCAL_RESOURCES_PB_FILE_NAME);
-        PlanLocalResourcesProto localResourcesProto =
-          PlanLocalResourcesProto.parseFrom(sessionResourcesStream);
+        PlanLocalResourcesProto sessionLocalResourcesProto =
+          PlanLocalResourcesProto.parseDelimitedFrom(sessionResourcesStream);
+        PlanLocalResourcesProto amLocalResourceProto = PlanLocalResourcesProto
+            .parseDelimitedFrom(sessionResourcesStream);
         sessionResources.putAll(DagTypeConverters.convertFromPlanLocalResources(
-          localResourcesProto));
+          sessionLocalResourcesProto));
+        amResources.putAll(DagTypeConverters.convertFromPlanLocalResources(amLocalResourceProto));
+        amResources.putAll(sessionResources);
       } finally {
         if (sessionResourcesStream != null) {
           sessionResourcesStream.close();
@@ -341,8 +400,16 @@ public class DAGAppMaster extends AbstractService {
       }
     }
 
+    recoveryEnabled = conf.getBoolean(TezConfiguration.DAG_RECOVERY_ENABLED,
+        TezConfiguration.DAG_RECOVERY_ENABLED_DEFAULT);
+
     initServices(conf);
     super.serviceInit(conf);
+
+    AMLaunchedEvent launchedEvent = new AMLaunchedEvent(appAttemptID,
+        startTime, appSubmitTime);
+    historyEventHandler.handle(
+        new DAGHistoryEvent(launchedEvent));
 
     this.state = DAGAppMasterState.INITED;
 
@@ -370,11 +437,13 @@ public class DAGAppMaster extends AbstractService {
     case INTERNAL_ERROR:
       state = DAGAppMasterState.ERROR;
       if(currentDAG != null) {
+        _updateLoggers(currentDAG, "_post");
         // notify dag to finish which will send the DAG_FINISHED event
         LOG.info("Internal Error. Notifying dags to finish.");
         sendEvent(new DAGEvent(currentDAG.getID(), DAGEventType.INTERNAL_ERROR));
       } else {
         LOG.info("Internal Error. Finishing directly as no dag is active.");
+        this.taskSchedulerEventHandler.setShouldUnregisterFlag();
         shutdownHandler.shutdown();
       }
       break;
@@ -382,6 +451,9 @@ public class DAGAppMaster extends AbstractService {
       DAGAppMasterEventDAGFinished finishEvt =
           (DAGAppMasterEventDAGFinished) event;
       if (!isSession) {
+        LOG.info("Not a session, AM will unregister as DAG has completed");
+        this.taskSchedulerEventHandler.setShouldUnregisterFlag();
+        _updateLoggers(currentDAG, "_post");
         setStateOnDAGCompletion();
         LOG.info("Shutting down on completion of dag:" +
               finishEvt.getDAGId().toString());
@@ -391,42 +463,85 @@ public class DAGAppMaster extends AbstractService {
             + finishEvt.getDAGId().toString()
             + ", dagState=" + finishEvt.getDAGState());
         lastDAGCompletionTime = clock.getTime();
+        _updateLoggers(currentDAG, "_post");
+        if (this.historyEventHandler.hasRecoveryFailed()) {
+          LOG.warn("Recovery had a fatal error, shutting down session after" +
+              " DAG completion");
+          sessionStopped.set(true);
+        }
         switch(finishEvt.getDAGState()) {
         case SUCCEEDED:
-          successfulDAGs.incrementAndGet();
+          if (!currentDAG.getName().startsWith(
+              TezConfiguration.TEZ_PREWARM_DAG_NAME_PREFIX)) {
+            successfulDAGs.incrementAndGet();
+          }
           break;
-        case ERROR:
         case FAILED:
-          failedDAGs.incrementAndGet();
+          if (!currentDAG.getName().startsWith(
+              TezConfiguration.TEZ_PREWARM_DAG_NAME_PREFIX)) {
+            failedDAGs.incrementAndGet();
+          }
           break;
         case KILLED:
-          killedDAGs.incrementAndGet();
+          if (!currentDAG.getName().startsWith(
+              TezConfiguration.TEZ_PREWARM_DAG_NAME_PREFIX)) {
+            killedDAGs.incrementAndGet();
+          }
           break;
+        case ERROR:
+          if (!currentDAG.getName().startsWith(
+              TezConfiguration.TEZ_PREWARM_DAG_NAME_PREFIX)) {
+            failedDAGs.incrementAndGet();
+          }
         default:
           LOG.fatal("Received a DAG Finished Event with state="
               + finishEvt.getDAGState()
               + ". Error. Shutting down.");
           state = DAGAppMasterState.ERROR;
+          this.taskSchedulerEventHandler.setShouldUnregisterFlag();
           shutdownHandler.shutdown();
           break;
         }
         if (!state.equals(DAGAppMasterState.ERROR)) {
           if (!sessionStopped.get()) {
             LOG.info("Waiting for next DAG to be submitted.");
-            taskSchedulerEventHandler.dagCompleted();
+            this.taskSchedulerEventHandler.dagCompleted();
             state = DAGAppMasterState.IDLE;
           } else {
             LOG.info("Session shutting down now.");
-            state = DAGAppMasterState.SUCCEEDED;
+            this.taskSchedulerEventHandler.setShouldUnregisterFlag();
+            if (this.historyEventHandler.hasRecoveryFailed()) {
+              state = DAGAppMasterState.FAILED;
+            } else {
+              state = DAGAppMasterState.SUCCEEDED;
+            }
             shutdownHandler.shutdown();
           }
         }
       }
       break;
+    case AM_REBOOT:
+      LOG.info("Received an AM_REBOOT signal");
+      this.state = DAGAppMasterState.KILLED;
+      shutdownHandler.shutdown(true);
+      break;
     default:
       throw new TezUncheckedException(
           "AppMaster: No handler for event type: " + event.getType());
     }
+  }
+
+  private void _updateLoggers(DAG dag, String appender) {
+    try {
+      TezUtils.updateLoggers(dag.getID().toString() + appender);
+    } catch (FileNotFoundException e) {
+      LOG.warn("Unable to update the logger. Continue with the old logger", e );
+    }
+  }
+
+  public void setCurrentDAG(DAG currentDAG) {
+    this.currentDAG = currentDAG;
+    context.setDAG(currentDAG);
   }
 
   private class DAGAppMasterEventHandler implements
@@ -441,6 +556,10 @@ public class DAGAppMaster extends AbstractService {
     private AtomicBoolean shutdownHandled = new AtomicBoolean(false);
 
     public void shutdown() {
+      shutdown(false);
+    }
+
+    public void shutdown(boolean now) {
       if(!shutdownHandled.compareAndSet(false, true)) {
         LOG.info("Ignoring multiple shutdown events");
         return;
@@ -448,20 +567,28 @@ public class DAGAppMaster extends AbstractService {
 
       LOG.info("Handling DAGAppMaster shutdown");
 
-      AMShutdownRunnable r = new AMShutdownRunnable();
+      AMShutdownRunnable r = new AMShutdownRunnable(now);
       Thread t = new Thread(r, "AMShutdownThread");
       t.start();
     }
 
     private class AMShutdownRunnable implements Runnable {
+      private final boolean immediateShutdown;
+
+      public AMShutdownRunnable(boolean immediateShutdown) {
+        this.immediateShutdown = immediateShutdown;
+      }
+
       @Override
       public void run() {
         // TODO:currently just wait for some time so clients can know the
         // final states. Will be removed once RM come on. TEZ-160.
-        try {
-          Thread.sleep(5000);
-        } catch (InterruptedException e) {
-          e.printStackTrace();
+        if (!immediateShutdown) {
+          try {
+            Thread.sleep(5000);
+          } catch (InterruptedException e) {
+            e.printStackTrace();
+          }
         }
 
         try {
@@ -482,10 +609,16 @@ public class DAGAppMaster extends AbstractService {
     }
   }
 
-  /** Create and initialize (but don't start) a single dag. */
   protected DAG createDAG(DAGPlan dagPB) {
-    TezDAGID dagId = TezDAGID.getInstance(appAttemptID.getApplicationId(),
-        dagCounter.incrementAndGet());
+    return createDAG(dagPB, null);
+  }
+
+  /** Create and initialize (but don't start) a single dag. */
+  DAGImpl createDAG(DAGPlan dagPB, TezDAGID dagId) {
+    if (dagId == null) {
+      dagId = TezDAGID.getInstance(appAttemptID.getApplicationId(),
+          dagCounter.incrementAndGet());
+    }
 
     Iterator<PlanKeyValuePair> iter =
         dagPB.getDagKeyValues().getConfKeyValuesList().iterator();
@@ -495,20 +628,33 @@ public class DAGAppMaster extends AbstractService {
       PlanKeyValuePair keyValPair = iter.next();
       dagConf.set(keyValPair.getKey(), keyValPair.getValue());
     }
-    
-    // Assuming DAG specific credentials will be available - TEZ-395
-    Credentials dagCredentials = this.amTokens;
-    if (dagCredentials == null) {
+
+    Credentials dagCredentials = null;
+    if (dagPB.hasCredentialsBinary()) {
+      dagCredentials = DagTypeConverters.convertByteStringToCredentials(dagPB
+          .getCredentialsBinary());
+      LogUtils.logCredentials(LOG, dagCredentials, "dag");
+    } else {
       dagCredentials = new Credentials();
     }
-    TokenCache.setJobToken(sessionToken, dagCredentials);
+    // TODO Does this move to the client in case of work-preserving recovery.
+    TokenCache.setSessionToken(sessionToken, dagCredentials);
 
     // create single dag
-    DAG newDag =
+    DAGImpl newDag =
         new DAGImpl(dagId, dagConf, dagPB, dispatcher.getEventHandler(),
             taskAttemptListener, dagCredentials, clock,
-            currentUser.getShortUserName(),
+            appMasterUgi.getShortUserName(),
             taskHeartbeatHandler, context);
+
+    try {
+      if (LOG.isDebugEnabled()) {
+        LOG.info("JSON dump for submitted DAG, dagId=" + dagId.toString()
+            + ", json=" + DAGUtils.generateSimpleJSONPlan(dagPB).toString());
+      }
+    } catch (JSONException e) {
+      LOG.warn("Failed to generate json for DAG", e);
+    }
 
     if (dagConf.getBoolean(TezConfiguration.TEZ_GENERATE_DAG_VIZ,
         TezConfiguration.TEZ_GENERATE_DAG_VIZ_DEFAULT)) {
@@ -526,26 +672,34 @@ public class DAGAppMaster extends AbstractService {
     return className;
   }
 
+
+  private String sanitizeLabelForViz(String label) {
+    Matcher m = sanitizeLabelPattern.matcher(label);
+    return m.replaceAll("_");
+  }
+
   private void generateDAGVizFile(TezDAGID dagId, DAGPlan dagPB) {
-    Graph graph = new Graph(dagPB.getName());
+    Graph graph = new Graph(sanitizeLabelForViz(dagPB.getName()));
 
     for (VertexPlan v : dagPB.getVertexList()) {
-      String nodeLabel = v.getName().replace("\\W","_")
+      String nodeLabel = sanitizeLabelForViz(v.getName())
           + "[" + getShortClassName(v.getProcessorDescriptor().getClassName() + "]");
-      Graph.Node n = graph.newNode(v.getName(), nodeLabel);
+      Graph.Node n = graph.newNode(sanitizeLabelForViz(v.getName()), nodeLabel);
       for (DAGProtos.RootInputLeafOutputProto input : v.getInputsList()) {
-        Graph.Node inputNode = graph.getNode(v.getName()
-            + "_" + input.getName());
-        inputNode.setLabel(v.getName() + "[" + input.getName() + "]");
+        Graph.Node inputNode = graph.getNode(sanitizeLabelForViz(v.getName())
+            + "_" + sanitizeLabelForViz(input.getName()));
+        inputNode.setLabel(sanitizeLabelForViz(v.getName())
+            + "[" + sanitizeLabelForViz(input.getName()) + "]");
         inputNode.setShape("box");
         inputNode.addEdge(n, "Input"
             + " [inputClass=" + getShortClassName(input.getEntityDescriptor().getClassName())
             + ", initializer=" + getShortClassName(input.getInitializerClassName()) + "]");
       }
       for (DAGProtos.RootInputLeafOutputProto output : v.getOutputsList()) {
-        Graph.Node outputNode = graph.getNode(v.getName()
-            + "_" + output.getName());
-        outputNode.setLabel(v.getName() + "[" + output.getName() + "]");
+        Graph.Node outputNode = graph.getNode(sanitizeLabelForViz(v.getName())
+            + "_" + sanitizeLabelForViz(output.getName()));
+        outputNode.setLabel(sanitizeLabelForViz(v.getName())
+            + "[" + sanitizeLabelForViz(output.getName()) + "]");
         outputNode.setShape("box");
         n.addEdge(outputNode, "Output"
             + " [outputClass=" + getShortClassName(output.getEntityDescriptor().getClassName())
@@ -555,8 +709,8 @@ public class DAGAppMaster extends AbstractService {
 
     for (DAGProtos.EdgePlan e : dagPB.getEdgeList()) {
 
-      Graph.Node n = graph.getNode(e.getInputVertexName());
-      n.addEdge(graph.getNode(e.getOutputVertexName()),
+      Graph.Node n = graph.getNode(sanitizeLabelForViz(e.getInputVertexName()));
+      n.addEdge(graph.getNode(sanitizeLabelForViz(e.getOutputVertexName())),
           "["
           + "input=" + getShortClassName(e.getEdgeSource().getClassName())
           + ", output=" + getShortClassName(e.getEdgeDestination().getClassName())
@@ -578,8 +732,11 @@ public class DAGAppMaster extends AbstractService {
     outputFile += dagId.toString() + ".dot";
 
     try {
+      LOG.info("Generating DAG graphviz file"
+          + ", dagId=" + dagId.toString()
+          + ", filePath=" + outputFile);
       graph.save(outputFile);
-    } catch (IOException e) {
+    } catch (Exception e) {
       LOG.warn("Error occurred when trying to save graph structure"
           + " for dag " + dagId.toString(), e);
     }
@@ -749,6 +906,7 @@ public class DAGAppMaster extends AbstractService {
 
   synchronized void shutdownTezAM() {
     sessionStopped.set(true);
+    this.taskSchedulerEventHandler.setShouldUnregisterFlag();
     if (currentDAG != null
         && !currentDAG.isComplete()) {
       //send a DAG_KILL message
@@ -764,8 +922,8 @@ public class DAGAppMaster extends AbstractService {
     }
   }
 
-  synchronized String submitDAGToAppMaster(DAGPlan dagPlan)
-      throws TezException  {
+  synchronized String submitDAGToAppMaster(DAGPlan dagPlan,
+      Map<String, LocalResource> additionalResources) throws TezException {
     if(currentDAG != null
         && !state.equals(DAGAppMasterState.IDLE)) {
       throw new TezException("App master already running a DAG");
@@ -781,6 +939,8 @@ public class DAGAppMaster extends AbstractService {
     LOG.info("Starting DAG submitted via RPC");
 
     if (LOG.isDebugEnabled()) {
+      LOG.debug("Invoked with additional local resources: " + additionalResources);
+      
       LOG.debug("Writing DAG plan to: "
           + TezConfiguration.TEZ_PB_PLAN_TEXT_NAME);
 
@@ -797,8 +957,53 @@ public class DAGAppMaster extends AbstractService {
     }
 
     submittedDAGs.incrementAndGet();
-    startDAG(dagPlan);
+    startDAG(dagPlan, additionalResources);
     return currentDAG.getID().toString();
+  }
+
+  synchronized void startPreWarmContainers(PreWarmContext preWarmContext)
+      throws TezException {
+    // Check if there is a running DAG
+    if(currentDAG != null
+        && !state.equals(DAGAppMasterState.IDLE)) {
+      throw new TezException("App master already running a DAG");
+    }
+
+    // Kill current pre-warm DAG if needed
+    // Launch new pre-warm DAG
+
+    org.apache.tez.dag.api.DAG dag =
+      new org.apache.tez.dag.api.DAG(
+          TezConfiguration.TEZ_PREWARM_DAG_NAME_PREFIX +
+              Integer.toString(dagCounter.get() + 1));
+    if (preWarmContext.getNumTasks() <= 0) {
+      LOG.warn("Ignoring pre-warm context as invalid numContainers specified: "
+          + preWarmContext.getNumTasks());
+      return;
+    }
+    org.apache.tez.dag.api.Vertex preWarmVertex = new
+        org.apache.tez.dag.api.Vertex("PreWarmVertex",
+      preWarmContext.getProcessorDescriptor(),
+      preWarmContext.getNumTasks(), preWarmContext.getResource());
+    if (preWarmContext.getEnvironment() != null) {
+      preWarmVertex.setTaskEnvironment(preWarmContext.getEnvironment());
+    }
+    if (preWarmContext.getLocalResources() != null) {
+      preWarmVertex.setTaskLocalResources(preWarmContext.getLocalResources());
+    }
+    if (preWarmContext.getLocationHints() != null) {
+      preWarmVertex.setTaskLocationsHint(
+        preWarmContext.getLocationHints().getTaskLocationHints());
+    }
+    if (preWarmContext.getJavaOpts() != null) {
+      preWarmVertex.setJavaOpts(preWarmContext.getJavaOpts());
+    }
+    dag.addVertex(preWarmVertex);
+    LOG.info("Pre-warming containers"
+        + ", processor=" + preWarmContext.getProcessorDescriptor().getClassName()
+        + ", numContainers=" + preWarmContext.getNumTasks()
+        + ", containerResource=" + preWarmContext.getResource());
+    startDAG(dag.createDag(amConf), null);
   }
 
   public class DAGClientHandler {
@@ -853,8 +1058,9 @@ public class DAGAppMaster extends AbstractService {
       sendEvent(new DAGEvent(dag.getID(), DAGEventType.DAG_KILL));
     }
 
-    public synchronized String submitDAG(DAGPlan dagPlan) throws TezException {
-      return submitDAGToAppMaster(dagPlan);
+    public synchronized String submitDAG(DAGPlan dagPlan,
+        Map<String, LocalResource> additionalAmResources) throws TezException {
+      return submitDAGToAppMaster(dagPlan, additionalAmResources);
     }
 
     public synchronized void shutdownAM() {
@@ -873,6 +1079,7 @@ public class DAGAppMaster extends AbstractService {
         return TezSessionStatus.INITIALIZING;
       case IDLE:
         return TezSessionStatus.READY;
+      case RECOVERING:
       case RUNNING:
         return TezSessionStatus.RUNNING;
       case ERROR:
@@ -882,6 +1089,109 @@ public class DAGAppMaster extends AbstractService {
         return TezSessionStatus.SHUTDOWN;
       }
       return TezSessionStatus.INITIALIZING;
+    }
+
+    public synchronized void preWarmContainers(PreWarmContext preWarmContext)
+        throws TezException {
+      startPreWarmContainers(preWarmContext);
+    }
+
+  }
+
+  private Map<String, LocalResource> getAdditionalLocalResourceDiff(
+      DAG dag, Map<String, LocalResource> additionalResources) throws TezException {
+    if (additionalResources == null) {
+      return Collections.emptyMap();
+    }
+    // Check for existing resources.
+    Iterator<Entry<String, LocalResource>> lrIter = additionalResources.entrySet().iterator();
+    while (lrIter.hasNext()) {
+      Entry<String, LocalResource> lrEntry = lrIter.next();
+      LocalResource existing = amResources.get(lrEntry.getKey());
+      if (existing != null) {
+        if (!isSameFile(dag, lrEntry.getKey(), existing, lrEntry.getValue())) {
+          throw new TezUncheckedException(
+              "Cannot add different additional resources with the same name : "
+                  + lrEntry.getKey() + ", Existing: [" + existing + "], New: ["
+                  + lrEntry.getValue() + "]");
+        } else {
+          lrIter.remove();
+        }
+      }
+    }
+    return containerSignatureMatcher.getAdditionalResources(amResources, additionalResources);
+  }
+
+  private boolean isSameFile(DAG dag, final String fileName,
+      final LocalResource oldLr, final LocalResource newLr) throws TezException {
+    try {
+      return oldLr.equals(newLr) || dag.getDagUGI().doAs(new PrivilegedExceptionAction<Boolean>() {
+        @Override
+        public Boolean run() throws Exception {
+          Configuration conf = getConfig();
+          byte[] oldSha = null;
+          try {
+            // The existing file must already be in usercache... let's try to find it.
+            Path localFile = findLocalFileForResource(fileName);
+            if (localFile != null) {
+              oldSha = RelocalizationUtils.getLocalSha(localFile, conf);
+            } else {
+              LOG.warn("Couldn't find local file for " + oldLr);
+            }
+          } catch (Exception ex) {
+            LOG.warn("Error getting SHA from local file for " + oldLr, ex);
+          }
+          if (oldSha == null) { // Well, no dice.
+            oldSha = RelocalizationUtils.getResourceSha(getLocalResourceUri(oldLr), conf);
+          }
+          // Get the new SHA directly from Hadoop stream. If it matches, we already have the
+          // file, and if it doesn't we are going to fail; no need to download either way.
+          byte[] newSha = RelocalizationUtils.getResourceSha(getLocalResourceUri(newLr), conf);
+          return Arrays.equals(oldSha, newSha);
+        }
+      });
+    } catch (InterruptedException ex) {
+      throw new TezException(ex);
+    } catch (IOException ex) {
+      throw new TezException(ex);
+    }
+  }
+
+  private static Path findLocalFileForResource(String fileName) {
+    URL localResource = ClassLoader.getSystemClassLoader().getResource(fileName);
+    if (localResource == null) return null;
+    return new Path(localResource.getPath());
+  }
+
+  private static URI getLocalResourceUri(LocalResource input) {
+    try {
+      return TezConverterUtils.getURIFromYarnURL(input.getResource());
+    } catch (URISyntaxException e) {
+      throw new TezUncheckedException("Failed while handling : " + input, e);
+    }
+  }
+
+  private List<URL> processAdditionalResources(Map<String, LocalResource> lrDiff)
+      throws TezException {
+    if (lrDiff == null || lrDiff.isEmpty()) {
+      return Collections.emptyList();
+    } else {
+      LOG.info("Localizing additional local resources for AM : " + lrDiff);
+      List<URL> downloadedURLs;
+      try {
+        downloadedURLs = RelocalizationUtils.processAdditionalResources(
+            Maps.transformValues(lrDiff, new Function<LocalResource, URI>() {
+
+              @Override
+              public URI apply(LocalResource input) {
+                return getLocalResourceUri(input);
+              }
+            }), getConfig());
+      } catch (IOException e) {
+        throw new TezException(e);
+      }
+      LOG.info("Done downloading additional AM resources");
+      return downloadedURLs;
     }
   }
 
@@ -893,8 +1203,11 @@ public class DAGAppMaster extends AbstractService {
     private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
     private final Lock rLock = rwLock.readLock();
     private final Lock wLock = rwLock.writeLock();
+    private final EventHandler eventHandler;
     public RunningAppContext(Configuration config) {
+      checkNotNull(config, "config is null");
       this.conf = config;
+      this.eventHandler = dispatcher.getEventHandler();
     }
 
     @Override
@@ -939,7 +1252,7 @@ public class DAGAppMaster extends AbstractService {
 
     @Override
     public EventHandler getEventHandler() {
-      return dispatcher.getEventHandler();
+      return eventHandler;
     }
 
     @Override
@@ -985,6 +1298,21 @@ public class DAGAppMaster extends AbstractService {
     @Override
     public DAGAppMasterState getAMState() {
       return state;
+    }
+
+    @Override
+    public HistoryEventHandler getHistoryHandler() {
+      return historyEventHandler;
+    }
+
+    @Override
+    public Path getCurrentRecoveryDir() {
+      return currentRecoveryDataDir;
+    }
+
+    @Override
+    public boolean isRecoveryEnabled() {
+      return recoveryEnabled;
     }
 
     @Override
@@ -1188,6 +1516,21 @@ public class DAGAppMaster extends AbstractService {
     }
   }
 
+  private RecoveredDAGData recoverDAG() throws IOException, TezException {
+    if (recoveryEnabled) {
+      if (this.appAttemptID.getAttemptId() > 1) {
+        LOG.info("Recovering data from previous attempts"
+            + ", currentAttemptId=" + this.appAttemptID.getAttemptId());
+        this.state = DAGAppMasterState.RECOVERING;
+        RecoveryParser recoveryParser = new RecoveryParser(
+            this, recoveryFS, recoveryDataDir, appAttemptID.getAttemptId());
+        RecoveredDAGData recoveredDAGData = recoveryParser.parseRecoveryData();
+        return recoveredDAGData;
+      }
+    }
+    return null;
+  }
+
   @SuppressWarnings("unchecked")
   @Override
   public synchronized void serviceStart() throws Exception {
@@ -1201,76 +1544,89 @@ public class DAGAppMaster extends AbstractService {
     DefaultMetricsSystem.initialize("DAGAppMaster");
 
     this.appsStartTime = clock.getTime();
-    AMStartedEvent startEvent = new AMStartedEvent(appAttemptID,
-        startTime, appsStartTime, appSubmitTime);
-    dispatcher.getEventHandler().handle(
+    AMStartedEvent startEvent = new AMStartedEvent(appAttemptID, appsStartTime);
+    historyEventHandler.handle(
         new DAGHistoryEvent(startEvent));
 
     this.lastDAGCompletionTime = clock.getTime();
 
-    if (!isSession) {
-      startDAG();
-    } else {
-      boolean preWarmContainersEnabled = amConf.getBoolean(
-        TezConfiguration.TEZ_SESSION_PRE_WARM_ENABLED,
-        TezConfiguration.TEZ_SESSION_PRE_WARM_ENABLED_DEFAULT);
-
-      boolean ranPreWarmContainersDAG = false;
-      if (preWarmContainersEnabled) {
-        ranPreWarmContainersDAG = runPreWarmContainersDAG();
-      }
-
-      if (!ranPreWarmContainersDAG) {
-        LOG.info("In Session mode. Waiting for DAG over RPC");
-        this.state = DAGAppMasterState.IDLE;
-
-        this.dagSubmissionTimer = new Timer(true);
-        this.dagSubmissionTimer.scheduleAtFixedRate(new TimerTask() {
-          @Override
-          public void run() {
-            checkAndHandleSessionTimeout();
-          }
-        }, sessionTimeoutInterval, sessionTimeoutInterval / 10);
-      }
-    }
-  }
-
-  private boolean runPreWarmContainersDAG() throws Exception {
-
-    InputStream dagPBBinaryStream = null;
+    RecoveredDAGData recoveredDAGData;
     try {
-      DAGPlan preWarmDAGPlan = null;
-      String preWarmDAGPlanPathStr =
-        amConf.get(TezConfiguration.TEZ_PRE_WARM_PB_PLAN_BINARY_PATH);
-      if (preWarmDAGPlanPathStr == null
-            || preWarmDAGPlanPathStr.isEmpty()) {
-        LOG.info("No path to pre-warm DAG plan specified");
-        return false;
+      recoveredDAGData = recoverDAG();
+    } catch (IOException e) {
+      LOG.error("Error occurred when trying to recover data from previous attempt."
+          + " Shutting down AM", e);
+      this.state = DAGAppMasterState.ERROR;
+      this.taskSchedulerEventHandler.setShouldUnregisterFlag();
+      shutdownHandler.shutdown();
+      return;
+    }
+
+    if (!isSession) {
+      LOG.info("In Non-Session mode.");
+    } else {
+      LOG.info("In Session mode. Waiting for DAG over RPC");
+      this.state = DAGAppMasterState.IDLE;
+    }
+
+    if (recoveredDAGData != null) {
+      List<URL> classpathUrls = null;
+      if (recoveredDAGData.cumulativeAdditionalResources != null) {
+        classpathUrls = processAdditionalResources(recoveredDAGData.cumulativeAdditionalResources);
+        amResources.putAll(recoveredDAGData.cumulativeAdditionalResources);
+        cumulativeAdditionalResources.putAll(recoveredDAGData.cumulativeAdditionalResources);
       }
-
-      LOG.info("Trying to run pre-warm DAG plan from specified path: "
-          + preWarmDAGPlanPathStr);
-
-      FileSystem fs = FileSystem.get(amConf);
-      Path preWarmDAGPlanPath = new Path(preWarmDAGPlanPathStr);
-      if (!fs.exists(preWarmDAGPlanPath)) {
-        LOG.info("Could not find pre-warm DAG plan file, path="
-          + preWarmDAGPlanPathStr);
-        return false;
+      
+      if (recoveredDAGData.isCompleted
+          || recoveredDAGData.nonRecoverable) {
+        LOG.info("Found previous DAG in completed or non-recoverable state"
+            + ", dagId=" + recoveredDAGData.recoveredDagID
+            + ", isCompleted=" + recoveredDAGData.isCompleted
+            + ", isNonRecoverable=" + recoveredDAGData.nonRecoverable
+            + ", state=" + (recoveredDAGData.dagState == null ? "null" :
+                recoveredDAGData.dagState)
+            + ", failureReason=" + recoveredDAGData.reason);
+        _updateLoggers(recoveredDAGData.recoveredDAG, "");
+        if (recoveredDAGData.nonRecoverable) {
+          DAGEventRecoverEvent recoverDAGEvent =
+              new DAGEventRecoverEvent(recoveredDAGData.recoveredDAG.getID(),
+                  DAGState.FAILED, classpathUrls);
+          dagEventDispatcher.handle(recoverDAGEvent);
+          this.state = DAGAppMasterState.RUNNING;
+        } else {
+          DAGEventRecoverEvent recoverDAGEvent =
+              new DAGEventRecoverEvent(recoveredDAGData.recoveredDAG.getID(),
+                  recoveredDAGData.dagState, classpathUrls);
+          dagEventDispatcher.handle(recoverDAGEvent);
+          this.state = DAGAppMasterState.RUNNING;
+        }
+      } else {
+        LOG.info("Found DAG to recover, dagId=" + recoveredDAGData.recoveredDAG.getID());
+        _updateLoggers(recoveredDAGData.recoveredDAG, "");
+        DAGEventRecoverEvent recoverDAGEvent = new DAGEventRecoverEvent(
+            recoveredDAGData.recoveredDAG.getID(), classpathUrls);
+        dagEventDispatcher.handle(recoverDAGEvent);
+        this.state = DAGAppMasterState.RUNNING;
       }
-
-      // Read the protobuf-based pre-warm DAG plan
-      dagPBBinaryStream = fs.open(preWarmDAGPlanPath);
-      preWarmDAGPlan = DAGPlan.parseFrom(dagPBBinaryStream);
-      startDAG(preWarmDAGPlan);
-
-    } finally {
-      if (dagPBBinaryStream != null) {
-        dagPBBinaryStream.close();
+    } else {
+      if (!isSession) {
+        // No dag recovered - in non-session, just restart the original DAG
+        dagCounter.set(0);
+        startDAG();
       }
     }
-    return true;
+
+    if (isSession) {
+      this.dagSubmissionTimer = new Timer(true);
+      this.dagSubmissionTimer.scheduleAtFixedRate(new TimerTask() {
+        @Override
+        public void run() {
+          checkAndHandleSessionTimeout();
+        }
+      }, sessionTimeoutInterval, sessionTimeoutInterval / 10);
+    }
   }
+
 
   @Override
   public synchronized void serviceStop() throws Exception {
@@ -1288,7 +1644,12 @@ public class DAGAppMaster extends AbstractService {
     @SuppressWarnings("unchecked")
     @Override
     public void handle(DAGEvent event) {
-      ((EventHandler<DAGEvent>)context.getCurrentDAG()).handle(event);
+      DAG dag = context.getCurrentDAG();
+      int eventDagIndex = event.getDAGId().getId();
+      if (dag == null || eventDagIndex != dag.getID().getId()) {
+        return; // event not relevant any more
+      }
+      ((EventHandler<DAGEvent>)dag).handle(event);
     }
   }
 
@@ -1296,8 +1657,15 @@ public class DAGAppMaster extends AbstractService {
     @SuppressWarnings("unchecked")
     @Override
     public void handle(TaskEvent event) {
+      DAG dag = context.getCurrentDAG();
+      int eventDagIndex = 
+          event.getTaskID().getVertexID().getDAGId().getId();
+      if (dag == null || eventDagIndex != dag.getID().getId()) {
+        return; // event not relevant any more
+      }
+      
       Task task =
-          context.getCurrentDAG().getVertex(event.getTaskID().getVertexID()).
+          dag.getVertex(event.getTaskID().getVertexID()).
               getTask(event.getTaskID());
       ((EventHandler<TaskEvent>)task).handle(event);
     }
@@ -1309,6 +1677,11 @@ public class DAGAppMaster extends AbstractService {
     @Override
     public void handle(TaskAttemptEvent event) {
       DAG dag = context.getCurrentDAG();
+      int eventDagIndex = 
+          event.getTaskAttemptID().getTaskID().getVertexID().getDAGId().getId();
+      if (dag == null || eventDagIndex != dag.getID().getId()) {
+        return; // event not relevant any more
+      }
       Task task =
           dag.getVertex(event.getTaskAttemptID().getTaskID().getVertexID()).
               getTask(event.getTaskAttemptID().getTaskID());
@@ -1323,7 +1696,13 @@ public class DAGAppMaster extends AbstractService {
     @Override
     public void handle(VertexEvent event) {
       DAG dag = context.getCurrentDAG();
-      org.apache.tez.dag.app.dag.Vertex vertex =
+      int eventDagIndex = 
+          event.getVertexId().getDAGId().getId();
+      if (dag == null || eventDagIndex != dag.getID().getId()) {
+        return; // event not relevant any more
+      }
+      
+      Vertex vertex =
           dag.getVertex(event.getVertexId());
       ((EventHandler<VertexEvent>) vertex).handle(event);
     }
@@ -1339,7 +1718,8 @@ public class DAGAppMaster extends AbstractService {
   }
 
   private synchronized void checkAndHandleSessionTimeout() {
-    if (this.state.equals(DAGAppMasterState.RUNNING)
+    if (EnumSet.of(DAGAppMasterState.RUNNING,
+        DAGAppMasterState.RECOVERING).contains(this.state)
         || sessionStopped.get()) {
       // DAG running or session already completed, cannot timeout session
       return;
@@ -1405,6 +1785,7 @@ public class DAGAppMaster extends AbstractService {
       ShutdownHookManager.get().addShutdownHook(
         new DAGAppMasterShutdownHook(appMaster), SHUTDOWN_HOOK_PRIORITY);
 
+      Limits.setConfiguration(conf);
       initAndStartAppMaster(appMaster, conf,
           jobUserName);
 
@@ -1437,16 +1818,21 @@ public class DAGAppMaster extends AbstractService {
       }
 
       if (EnumSet.of(DAGAppMasterState.NEW, DAGAppMasterState.INITED,
-          DAGAppMasterState.IDLE, DAGAppMasterState.RUNNING)
-          .contains(appMaster.state)) {
+          DAGAppMasterState.IDLE).contains(appMaster.state)) {
             // DAG not in a final state. Must have receive a KILL signal
         appMaster.state = DAGAppMasterState.KILLED;
+      } else if (appMaster.state == DAGAppMasterState.RUNNING) {
+        appMaster.state = DAGAppMasterState.ERROR;
       }
+
       appMaster.stop();
+
+
+
     }
   }
 
-  private void startDAG() throws IOException {
+  private void startDAG() throws IOException, TezException {
     FileInputStream dagPBBinaryStream = null;
     try {
       DAGPlan dagPlan = null;
@@ -1456,7 +1842,7 @@ public class DAGAppMaster extends AbstractService {
           TezConfiguration.TEZ_PB_PLAN_BINARY_NAME);
       dagPlan = DAGPlan.parseFrom(dagPBBinaryStream);
 
-      startDAG(dagPlan);
+      startDAG(dagPlan, null);
 
     } finally {
       if (dagPBBinaryStream != null) {
@@ -1465,8 +1851,14 @@ public class DAGAppMaster extends AbstractService {
     }
   }
 
-  private void startDAG(DAGPlan dagPlan) {
+  private void startDAG(DAGPlan dagPlan, Map<String, LocalResource> additionalAMResources)
+      throws TezException {
+    long submitTime = this.clock.getTime();
     this.state = DAGAppMasterState.RUNNING;
+    this.appName = dagPlan.getName();
+    // /////////////////// Create the job itself.
+    DAG newDAG = createDAG(dagPlan);
+    _updateLoggers(newDAG, "");
     if (LOG.isDebugEnabled()) {
       LOG.debug("Running a DAG with " + dagPlan.getVertexCount()
           + " vertices ");
@@ -1474,18 +1866,46 @@ public class DAGAppMaster extends AbstractService {
         LOG.debug("DAG has vertex " + v.getName());
       }
     }
+    Map<String, LocalResource> lrDiff = getAdditionalLocalResourceDiff(
+        newDAG, additionalAMResources);
+    if (lrDiff != null) {
+      amResources.putAll(lrDiff);
+      cumulativeAdditionalResources.putAll(lrDiff);
+    }
 
+    LOG.info("Running DAG: " + dagPlan.getName());
     // Job name is the same as the app name until we support multiple dags
     // for an app later
-    appName = dagPlan.getName();
+    DAGSubmittedEvent submittedEvent = new DAGSubmittedEvent(newDAG.getID(),
+        submitTime, dagPlan, this.appAttemptID, cumulativeAdditionalResources);
+    try {
+      historyEventHandler.handleCriticalEvent(
+          new DAGHistoryEvent(newDAG.getID(), submittedEvent));
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
 
-    // /////////////////// Create the job itself.
-    DAG newDAG = createDAG(dagPlan);
-    startDAG(newDAG);
+    startDAGExecution(newDAG, lrDiff);
   }
 
-  private void startDAG(DAG dag) {
+  private void startDAGExecution(DAG dag, final Map<String, LocalResource> additionalAmResources)
+      throws TezException {
     currentDAG = dag;
+
+    // Try localizing the actual resources.
+    List<URL> additionalUrlsForClasspath;
+    try {
+      additionalUrlsForClasspath = dag.getDagUGI().doAs(new PrivilegedExceptionAction<List<URL>>() {
+        @Override
+        public List<URL> run() throws Exception {
+          return processAdditionalResources(additionalAmResources);
+        }
+      });
+    } catch (IOException e) {
+      throw new TezException(e);
+    } catch (InterruptedException e) {
+      throw new TezException(e);
+    }
 
     // End of creating the job.
     ((RunningAppContext) context).setDAG(currentDAG);
@@ -1499,7 +1919,7 @@ public class DAGAppMaster extends AbstractService {
 
     // All components have started, start the job.
     /** create a job-start event to get this ball rolling */
-    DAGEvent startDagEvent = new DAGEvent(currentDAG.getID(), DAGEventType.DAG_START);
+    DAGEvent startDagEvent = new DAGEventStartDag(currentDAG.getID(), additionalUrlsForClasspath);
     /** send the job-start event. this triggers the job execution. */
     sendEvent(startDagEvent);
   }
@@ -1509,12 +1929,11 @@ public class DAGAppMaster extends AbstractService {
       final Configuration conf, String jobUserName) throws IOException,
       InterruptedException {
     UserGroupInformation.setConfiguration(conf);
-    appMaster.currentUser = UserGroupInformation.getCurrentUser();
     Credentials credentials = UserGroupInformation.getCurrentUser().getCredentials();
 
-    UserGroupInformation appMasterUgi = UserGroupInformation
+    appMaster.appMasterUgi = UserGroupInformation
         .createRemoteUser(jobUserName);
-    appMasterUgi.addCredentials(credentials);
+    appMaster.appMasterUgi.addCredentials(credentials);
 
     // Now remove the AM->RM token so tasks don't have it
     Iterator<Token<?>> iter = credentials.getAllTokens().iterator();
@@ -1527,7 +1946,7 @@ public class DAGAppMaster extends AbstractService {
 
     appMaster.amTokens = credentials;
 
-    appMasterUgi.doAs(new PrivilegedExceptionAction<Object>() {
+    appMaster.appMasterUgi.doAs(new PrivilegedExceptionAction<Object>() {
       @Override
       public Object run() throws Exception {
         appMaster.init(conf);
@@ -1540,5 +1959,9 @@ public class DAGAppMaster extends AbstractService {
   @SuppressWarnings("unchecked")
   private void sendEvent(Event<?> event) {
     dispatcher.getEventHandler().handle(event);
+  }
+
+  synchronized void setDAGCounter(int dagCounter) {
+    this.dagCounter.set(dagCounter);
   }
 }

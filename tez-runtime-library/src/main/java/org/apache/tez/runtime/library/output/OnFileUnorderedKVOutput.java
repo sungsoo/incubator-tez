@@ -19,6 +19,7 @@
 package org.apache.tez.runtime.library.output;
 
 import java.nio.ByteBuffer;
+import java.util.BitSet;
 import java.util.Collections;
 import java.util.List;
 
@@ -61,14 +62,16 @@ public class OnFileUnorderedKVOutput implements LogicalOutput {
   }
 
   @Override
-  public List<Event> initialize(TezOutputContext outputContext)
+  public synchronized List<Event> initialize(TezOutputContext outputContext)
       throws Exception {
     this.outputContext = outputContext;
     this.conf = TezUtils.createConfFromUserPayload(outputContext
         .getUserPayload());
     this.conf.setStrings(TezJobConfig.LOCAL_DIRS,
         outputContext.getWorkDirs());
-    
+
+    this.outputContext.requestInitialMemory(0l, null); // mandatory call
+
     this.dataViaEventsEnabled = conf.getBoolean(
         TezJobConfig.TEZ_RUNTIME_BROADCAST_DATA_VIA_EVENTS_ENABLED,
         TezJobConfig.TEZ_RUNTIME_BROADCAST_DATA_VIA_EVENTS_ENABLED_DEFAULT);
@@ -85,17 +88,22 @@ public class OnFileUnorderedKVOutput implements LogicalOutput {
   }
 
   @Override
-  public KeyValueWriter getWriter() throws Exception {
+  public synchronized void start() {
+  }
+
+  @Override
+  public synchronized KeyValueWriter getWriter() throws Exception {
+    // Eventually, disallow multiple invocations.
     return kvWriter;
   }
 
   @Override
-  public void handleEvents(List<Event> outputEvents) {
+  public synchronized void handleEvents(List<Event> outputEvents) {
     throw new TezUncheckedException("Not expecting any events");
   }
 
   @Override
-  public List<Event> close() throws Exception {
+  public synchronized List<Event> close() throws Exception {
     boolean outputGenerated = this.kvWriter.close();
     
     DataMovementEventPayloadProto.Builder payloadBuilder = DataMovementEventPayloadProto
@@ -119,7 +127,15 @@ public class OnFileUnorderedKVOutput implements LogicalOutput {
         .getServiceProviderMetaData(ShuffleUtils.SHUFFLE_HANDLER_SERVICE_ID);
     int shufflePort = ShuffleUtils
         .deserializeShuffleProviderMetaData(shuffleMetadata);
-    payloadBuilder.setOutputGenerated(outputGenerated);
+    // Set the list of empty partitions - single partition on this case.
+    if (!outputGenerated) {
+      LOG.info("No output was generated");
+      BitSet emptyPartitions = new BitSet();
+      emptyPartitions.set(0);
+      ByteString emptyPartitionsBytesString =
+          TezUtils.compressByteArrayToByteString(TezUtils.toByteArray(emptyPartitions));
+      payloadBuilder.setEmptyPartitions(emptyPartitionsBytesString);
+    }
     if (outputGenerated) {
       payloadBuilder.setHost(host);
       payloadBuilder.setPort(shufflePort);
@@ -135,7 +151,7 @@ public class OnFileUnorderedKVOutput implements LogicalOutput {
   }
 
   @Override
-  public void setNumPhysicalOutputs(int numOutputs) {
+  public synchronized void setNumPhysicalOutputs(int numOutputs) {
     Preconditions.checkArgument(numOutputs == 1,
         "Number of outputs can only be 1 for " + this.getClass().getName());
   }

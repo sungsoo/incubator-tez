@@ -17,6 +17,7 @@
  */
 package org.apache.tez.mapreduce.processor.reduce;
 
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Collections;
@@ -51,6 +52,7 @@ import org.apache.tez.mapreduce.hadoop.MultiStageMRConfToTezTranslator;
 import org.apache.tez.mapreduce.hadoop.MultiStageMRConfigUtil;
 import org.apache.tez.mapreduce.input.MRInputLegacy;
 import org.apache.tez.mapreduce.output.MROutput;
+import org.apache.tez.mapreduce.output.MROutputLegacy;
 import org.apache.tez.mapreduce.partition.MRPartitioner;
 import org.apache.tez.mapreduce.processor.MapUtils;
 import org.apache.tez.runtime.LogicalIOProcessorRuntimeTask;
@@ -67,6 +69,8 @@ import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+
+import com.google.common.collect.HashMultimap;
 
 
 @SuppressWarnings("deprecation")
@@ -110,7 +114,7 @@ public class TestReduceProcessor {
 
   @Test
   public void testReduceProcessor() throws Exception {
-
+    final String dagName = "mrdag0";
     String mapVertexName = MultiStageMRConfigUtil.getInitialMapVertexName();
     String reduceVertexName = MultiStageMRConfigUtil.getFinalReduceVertexName();
     JobConf jobConf = new JobConf(defaultConf);
@@ -138,7 +142,7 @@ public class TestReduceProcessor {
     OutputSpec mapOutputSpec = new OutputSpec("NullDestVertex", new OutputDescriptor(LocalOnFileSorterOutput.class.getName()), 1);
     // Run a map
     LogicalIOProcessorRuntimeTask mapTask = MapUtils.createLogicalTask(localFs, workDir, mapConf, 0,
-        mapInput, new TestUmbilical(), mapVertexName,
+        mapInput, new TestUmbilical(), dagName, mapVertexName,
         Collections.singletonList(mapInputSpec),
         Collections.singletonList(mapOutputSpec));
 
@@ -160,16 +164,19 @@ public class TestReduceProcessor {
     ProcessorDescriptor reduceProcessorDesc = new ProcessorDescriptor(
         ReduceProcessor.class.getName()).setUserPayload(TezUtils.createUserPayloadFromConf(reduceConf));
     
-    InputSpec reduceInputSpec = new InputSpec(mapVertexName, new InputDescriptor(LocalMergedInput.class.getName()), 1);
-    OutputSpec reduceOutputSpec = new OutputSpec("NullDestinationVertex", new OutputDescriptor(MROutput.class.getName()), 1);
-    
+    InputSpec reduceInputSpec = new InputSpec(mapVertexName,
+        new InputDescriptor(LocalMergedInput.class.getName()), 1);
+    OutputSpec reduceOutputSpec = new OutputSpec("NullDestinationVertex",
+        new OutputDescriptor(MROutputLegacy.class.getName()), 1);
+
     // Now run a reduce
     TaskSpec taskSpec = new TaskSpec(
         TezTestUtils.getMockTaskAttemptId(0, 1, 0, 0),
+        dagName,
         reduceVertexName,
         reduceProcessorDesc,
         Collections.singletonList(reduceInputSpec),
-        Collections.singletonList(reduceOutputSpec));
+        Collections.singletonList(reduceOutputSpec), null);
 
     Map<String, ByteBuffer> serviceConsumerMetadata = new HashMap<String, ByteBuffer>();
     serviceConsumerMetadata.put(ShuffleUtils.SHUFFLE_HANDLER_SERVICE_ID,
@@ -180,7 +187,8 @@ public class TestReduceProcessor {
         0,
         reduceConf,
         new TestUmbilical(),
-        serviceConsumerMetadata);
+        serviceConsumerMetadata,
+        HashMultimap.<String, String>create());
     
     task.initialize();
     task.run();
@@ -196,9 +204,10 @@ public class TestReduceProcessor {
     // Only a task commit happens, hence the data is still in the temporary directory.
     Path reduceOutputDir = new Path(new Path(workDir, "output"),
         "_temporary/0/" + IDConverter
-            .toMRTaskId(TezTestUtils.getMockTaskId(0, 1, 0)));
-    Path reduceOutputFile = new Path(reduceOutputDir, "part-00000");
-
+            .toMRTaskIdForOutput(TezTestUtils.getMockTaskId(0, 1, 0)));
+    
+    Path reduceOutputFile = new Path(reduceOutputDir, "part-v001-o000-00000");
+    
     SequenceFile.Reader reader = new SequenceFile.Reader(localFs,
         reduceOutputFile, reduceConf);
 

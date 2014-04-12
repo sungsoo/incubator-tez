@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -49,6 +50,7 @@ import org.apache.tez.dag.app.dag.event.DAGAppMasterEvent;
 import org.apache.tez.dag.app.dag.event.DAGAppMasterEventType;
 import org.apache.tez.dag.app.dag.event.DAGEventSchedulerUpdateTAAssigned;
 import org.apache.tez.dag.app.rm.TaskScheduler.TaskSchedulerAppCallback;
+import org.apache.tez.dag.app.rm.container.AMContainer;
 import org.apache.tez.dag.app.rm.container.AMContainerEventAssignTA;
 import org.apache.tez.dag.app.rm.container.AMContainerEventCompleted;
 import org.apache.tez.dag.app.rm.container.AMContainerEventLaunchRequest;
@@ -57,6 +59,7 @@ import org.apache.tez.dag.app.rm.container.AMContainerEventTASucceeded;
 import org.apache.tez.dag.app.rm.container.AMContainerState;
 import org.apache.tez.dag.app.rm.container.ContainerSignatureMatcher;
 import org.apache.tez.dag.app.rm.node.AMNodeEventContainerAllocated;
+import org.apache.tez.dag.app.rm.node.AMNodeEventNodeCountUpdated;
 import org.apache.tez.dag.app.rm.node.AMNodeEventStateChanged;
 import org.apache.tez.dag.app.rm.node.AMNodeEventTaskAttemptEnded;
 import org.apache.tez.dag.app.rm.node.AMNodeEventTaskAttemptSucceeded;
@@ -78,6 +81,9 @@ public class TaskSchedulerEventHandler extends AbstractService
   protected volatile boolean isSignalled = false;
   final DAGClientServer clientService;
   private final ContainerSignatureMatcher containerSignatureMatcher;
+  private int cachedNodeCount = -1;
+  private AtomicBoolean shouldUnregisterFlag =
+      new AtomicBoolean(false);
 
   BlockingQueue<AMSchedulerEvent> eventQueue
                               = new LinkedBlockingQueue<AMSchedulerEvent>();
@@ -101,6 +107,10 @@ public class TaskSchedulerEventHandler extends AbstractService
     LOG.info("TaskScheduler notified that iSignalled was : " + isSignalled);
   }
 
+  public int getNumClusterNodes() {
+    return cachedNodeCount;
+  }
+  
   public Resource getAvailableResources() {
     return taskScheduler.getAvailableResources();
   }
@@ -132,15 +142,17 @@ public class TaskSchedulerEventHandler extends AbstractService
     case S_CONTAINER_DEALLOCATE:
       handleContainerDeallocate((AMSchedulerEventDeallocateContainer)sEvent);
       break;
-    case S_CONTAINERS_ALLOCATED:
-      break;
-    case S_CONTAINER_COMPLETED:
+    case S_NODE_UNBLACKLISTED:
+      // fall through
     case S_NODE_BLACKLISTED:
+      handleNodeBlacklistUpdate((AMSchedulerEventNodeBlacklistUpdate)sEvent);
       break;
     case S_NODE_UNHEALTHY:
       break;
     case S_NODE_HEALTHY:
       // Consider changing this to work like BLACKLISTING.
+      break;
+    default:
       break;
     }
   }
@@ -168,6 +180,15 @@ public class TaskSchedulerEventHandler extends AbstractService
     eventHandler.handle(event);
   }
 
+  private void handleNodeBlacklistUpdate(AMSchedulerEventNodeBlacklistUpdate event) {
+    if (event.getType() == AMSchedulerEventType.S_NODE_BLACKLISTED) {
+      taskScheduler.blacklistNode(event.getNodeId());
+    } else if (event.getType() == AMSchedulerEventType.S_NODE_UNBLACKLISTED) {
+      taskScheduler.unblacklistNode(event.getNodeId());
+    } else {
+      throw new TezUncheckedException("Invalid event type: " + event.getType());
+    }
+  }
 
   private void handleContainerDeallocate(
                                   AMSchedulerEventDeallocateContainer event) {
@@ -325,14 +346,17 @@ public class TaskSchedulerEventHandler extends AbstractService
   
   @Override
   public synchronized void serviceStart() {
-    // FIXME hack alert how is this supposed to support multiple DAGs?
-    // Answer: this is shared across dags. need job==app-dag-master
     InetSocketAddress serviceAddr = clientService.getBindAddress();
     dagAppMaster = appContext.getAppMaster();
     taskScheduler = createTaskScheduler(serviceAddr.getHostName(),
         serviceAddr.getPort(), "", appContext);
     taskScheduler.init(getConfig());
     taskScheduler.start();
+    if (shouldUnregisterFlag.get()) {
+      // Flag may have been set earlier when task scheduler was not initialized
+      taskScheduler.setShouldUnregister();
+    }
+
     this.eventHandlingThread = new Thread("TaskSchedulerEventHandlerThread") {
       @Override
       public void run() {
@@ -395,7 +419,7 @@ public class TaskSchedulerEventHandler extends AbstractService
     // because the deallocateTask downcall may have raced with the
     // taskAllocated() upcall
     assert task.equals(taskAttempt);
-    
+ 
     if (appContext.getAllContainers().get(containerId).getState() == AMContainerState.ALLOCATED) {
       sendEvent(new AMContainerEventLaunchRequest(containerId, taskAttempt.getVertexID(),
           event.getContainerContext()));
@@ -409,12 +433,18 @@ public class TaskSchedulerEventHandler extends AbstractService
   @Override
   public synchronized void containerCompleted(Object task, ContainerStatus containerStatus) {
     // Inform the Containers about completion.
-    sendEvent(new AMContainerEventCompleted(containerStatus));
+    AMContainer amContainer = appContext.getAllContainers().get(containerStatus.getContainerId());
+    if (amContainer != null) {
+      sendEvent(new AMContainerEventCompleted(containerStatus));
+    }
   }
 
   @Override
   public synchronized void containerBeingReleased(ContainerId containerId) {
-    sendEvent(new AMContainerEventStopRequest(containerId));
+    AMContainer amContainer = appContext.getAllContainers().get(containerId);
+    if (amContainer != null) {
+      sendEvent(new AMContainerEventStopRequest(containerId));
+    }
   }
 
   @SuppressWarnings("unchecked")
@@ -432,7 +462,7 @@ public class TaskSchedulerEventHandler extends AbstractService
     // This can happen if the RM has been restarted. If it is in that state,
     // this application must clean itself up.
     LOG.info("App shutdown requested by scheduler");
-    sendEvent(new DAGAppMasterEvent(DAGAppMasterEventType.INTERNAL_ERROR));
+    sendEvent(new DAGAppMasterEvent(DAGAppMasterEventType.AM_REBOOT));
   }
 
   @Override
@@ -497,6 +527,13 @@ public class TaskSchedulerEventHandler extends AbstractService
   // complete and can hence lead to a deadlock if called from within a TSEH lock.
   @Override
   public float getProgress() {
+    // at this point allocate has been called and so node count must be available
+    // may change after YARN-1722
+    int nodeCount = taskScheduler.getClusterNodeCount();
+    if (nodeCount != cachedNodeCount) {
+      cachedNodeCount = nodeCount;
+      sendEvent(new AMNodeEventNodeCountUpdated(cachedNodeCount));
+    }
     return dagAppMaster.getProgress();
   }
 
@@ -517,4 +554,13 @@ public class TaskSchedulerEventHandler extends AbstractService
     sendEvent(new AMContainerEventCompleted(ContainerStatus.newInstance(
         containerId, ContainerState.COMPLETE, "Container Preempted Internally", -1), true));
   }
+
+  public void setShouldUnregisterFlag() {
+    LOG.info("TaskScheduler notified that it should unregister from RM");
+    this.shouldUnregisterFlag.set(true);
+    if (this.taskScheduler != null) {
+      this.taskScheduler.setShouldUnregister();
+    }
+  }
+
 }

@@ -62,6 +62,9 @@ import org.apache.tez.runtime.api.impl.TaskSpec;
 import org.apache.tez.runtime.api.impl.TezUmbilical;
 import org.apache.tez.runtime.library.shuffle.common.ShuffleUtils;
 
+import com.google.common.collect.HashMultimap;
+
+
 public class MapUtils {
 
   private static final Log LOG = LogFactory.getLog(MapUtils.class);
@@ -190,7 +193,7 @@ public class MapUtils {
   
   public static LogicalIOProcessorRuntimeTask createLogicalTask(FileSystem fs, Path workDir,
       JobConf jobConf, int mapId, Path mapInput,
-      TezUmbilical umbilical,
+      TezUmbilical umbilical, String dagName,
       String vertexName, List<InputSpec> inputSpecs,
       List<OutputSpec> outputSpecs) throws Exception {
     jobConf.setInputFormat(SequenceFileInputFormat.class);
@@ -202,10 +205,10 @@ public class MapUtils {
 
     TaskSpec taskSpec = new TaskSpec(
         TezTestUtils.getMockTaskAttemptId(0, 0, mapId, 0),
-        vertexName,
+        dagName, vertexName,
         mapProcessorDesc,
         inputSpecs,
-        outputSpecs);
+        outputSpecs, null);
 
     Map<String, ByteBuffer> serviceConsumerMetadata = new HashMap<String, ByteBuffer>();
     serviceConsumerMetadata.put(ShuffleUtils.SHUFFLE_HANDLER_SERVICE_ID,
@@ -216,7 +219,8 @@ public class MapUtils {
         0,
         jobConf,
         umbilical,
-        serviceConsumerMetadata);
+        serviceConsumerMetadata,
+        HashMultimap.<String, String>create());
     return task;
   }
 }

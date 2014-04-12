@@ -19,6 +19,7 @@ package org.apache.tez.mapreduce.processor.reduce;
 
 import java.io.IOException;
 import java.util.Iterator;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 
@@ -36,17 +37,17 @@ import org.apache.hadoop.util.Progress;
 import org.apache.hadoop.util.Progressable;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.tez.common.counters.TaskCounter;
-import org.apache.tez.common.counters.TezCounter;
-import org.apache.tez.mapreduce.output.MROutput;
+import org.apache.tez.mapreduce.output.MROutputLegacy;
 import org.apache.tez.mapreduce.processor.MRTask;
 import org.apache.tez.mapreduce.processor.MRTaskReporter;
 import org.apache.tez.runtime.api.Event;
+import org.apache.tez.runtime.api.Input;
 import org.apache.tez.runtime.api.LogicalIOProcessor;
 import org.apache.tez.runtime.api.LogicalInput;
 import org.apache.tez.runtime.api.LogicalOutput;
 import org.apache.tez.runtime.api.TezProcessorContext;
-import org.apache.tez.runtime.library.api.KeyValuesReader;
 import org.apache.tez.runtime.library.api.KeyValueWriter;
+import org.apache.tez.runtime.library.api.KeyValuesReader;
 import org.apache.tez.runtime.library.common.ConfigUtils;
 import org.apache.tez.runtime.library.common.sort.impl.TezRawKeyValueIterator;
 import org.apache.tez.runtime.library.input.ShuffledMergedInputLegacy;
@@ -54,9 +55,7 @@ import org.apache.tez.runtime.library.output.OnFileSortedOutput;
 
 
 @SuppressWarnings({ "unchecked", "rawtypes" })
-public class ReduceProcessor
-extends MRTask
-implements LogicalIOProcessor {
+public class ReduceProcessor extends MRTask implements LogicalIOProcessor {
 
   private static final Log LOG = LogFactory.getLog(ReduceProcessor.class);
 
@@ -95,8 +94,6 @@ implements LogicalIOProcessor {
 
     LOG.info("Running reduce: " + processorContext.getUniqueIdentifier());
 
-    initTask();
-
     if (outputs.size() <= 0 || outputs.size() > 1) {
       throw new IOException("Invalid number of outputs"
           + ", outputCount=" + outputs.size());
@@ -108,7 +105,17 @@ implements LogicalIOProcessor {
     }
 
     LogicalInput in = inputs.values().iterator().next();
+    in.start();
+
+    List<Input> pendingInputs = new LinkedList<Input>();
+    pendingInputs.add(in);
+    processorContext.waitForAllInputsReady(pendingInputs);
+    LOG.info("Input is ready for consumption. Starting Output");
+
     LogicalOutput out = outputs.values().iterator().next();
+    out.start();
+
+    initTask(out);
 
     this.statusUpdate();
 
@@ -133,12 +140,12 @@ implements LogicalIOProcessor {
     KeyValuesReader kvReader = shuffleInput.getReader();
 
     KeyValueWriter kvWriter = null;
-    if((out instanceof MROutput)) {
-      kvWriter = ((MROutput) out).getWriter();
+    if((out instanceof MROutputLegacy)) {
+      kvWriter = ((MROutputLegacy) out).getWriter();
     } else if ((out instanceof OnFileSortedOutput)) {
       kvWriter = ((OnFileSortedOutput) out).getWriter();
     } else {
-      throw new IOException("Illegal input to reduce: " + in.getClass());
+      throw new IOException("Illegal output to reduce: " + in.getClass());
     }
 
     if (useNewApi) {
@@ -157,7 +164,7 @@ implements LogicalIOProcessor {
           kvReader, comparator, keyClass, valueClass, kvWriter);
     }
 
-    done(out);
+    done();
   }
 
   void runOldReducer(JobConf job,
@@ -345,16 +352,6 @@ implements LogicalIOProcessor {
       throws IOException, InterruptedException {
     super.localizeConfiguration(jobConf);
     jobConf.setBoolean(JobContext.TASK_ISMAP, false);
-  }
-
-  @Override
-  public TezCounter getOutputRecordsCounter() {
-    return processorContext.getCounters().findCounter(TaskCounter.REDUCE_OUTPUT_RECORDS);
-  }
-
-  @Override
-  public TezCounter getInputRecordsCounter() {
-    return processorContext.getCounters().findCounter(TaskCounter.REDUCE_INPUT_GROUPS);
   }
 
 }

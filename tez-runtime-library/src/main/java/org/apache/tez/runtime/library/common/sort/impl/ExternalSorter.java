@@ -52,6 +52,8 @@ import org.apache.tez.runtime.library.common.sort.impl.IFile.Writer;
 import org.apache.tez.runtime.library.common.task.local.output.TezTaskOutput;
 import org.apache.tez.runtime.library.hadoop.compat.NullProgressable;
 
+import com.google.common.base.Preconditions;
+
 @SuppressWarnings({"unchecked", "rawtypes"})
 public abstract class ExternalSorter {
 
@@ -62,44 +64,80 @@ public abstract class ExternalSorter {
   public abstract void flush() throws IOException;
 
   public abstract void write(Object key, Object value) throws IOException;
-  
-  protected Progressable nullProgressable = new NullProgressable();
-  protected TezOutputContext outputContext;
-  protected Combiner combiner;
-  protected Partitioner partitioner;
-  protected Configuration conf;
-  protected FileSystem rfs;
-  protected TezTaskOutput mapOutputFile;
-  protected int partitions;
-  protected Class keyClass;
-  protected Class valClass;
-  protected RawComparator comparator;
-  protected SerializationFactory serializationFactory;
-  protected Serializer keySerializer;
-  protected Serializer valSerializer;
-  
-  protected boolean ifileReadAhead;
-  protected int ifileReadAheadLength;
-  protected int ifileBufferSize;
 
-  protected IndexedSorter sorter;
+  protected final Progressable nullProgressable = new NullProgressable();
+  protected final TezOutputContext outputContext;
+  protected final Combiner combiner;
+  protected final Partitioner partitioner;
+  protected final Configuration conf;
+  protected final FileSystem rfs;
+  protected final TezTaskOutput mapOutputFile;
+  protected final int partitions;
+  protected final Class keyClass;
+  protected final Class valClass;
+  protected final RawComparator comparator;
+  protected final SerializationFactory serializationFactory;
+  protected final Serializer keySerializer;
+  protected final Serializer valSerializer;
+  
+  protected final boolean ifileReadAhead;
+  protected final int ifileReadAheadLength;
+  protected final int ifileBufferSize;
+
+  protected final int availableMemoryMb;
+
+  protected final IndexedSorter sorter;
 
   // Compression for map-outputs
-  protected CompressionCodec codec;
+  protected final CompressionCodec codec;
 
   // Counters
-  // TODO TEZ Rename all counter variables [Mapping of counter to MR for compatibility in the MR layer]
-  protected TezCounter mapOutputByteCounter;
-  protected TezCounter mapOutputRecordCounter;
-  protected TezCounter fileOutputByteCounter;
-  protected TezCounter spilledRecordsCounter;
+  // MR compatilbity layer needs to rename counters back to what MR requries.
 
-  public void initialize(TezOutputContext outputContext, Configuration conf, int numOutputs) throws IOException {
+  // Represents final deserialized size of output (spills are not counted)
+  protected final TezCounter mapOutputByteCounter;
+  // Represents final number of records written (spills are not counted)
+  protected final TezCounter mapOutputRecordCounter;
+  // Represents the size of the final output - with any overheads introduced by
+  // the storage/serialization mechanism. This is an uncompressed data size.
+  protected final TezCounter outputBytesWithOverheadCounter;
+  // Represents the size of the final output - which will be transmitted over
+  // the wire (spills are not counted). Factors in compression if it is enabled.
+  protected final TezCounter fileOutputByteCounter;
+  // Represents total number of records written to disk (includes spills. Min
+  // value for this is equal to number of output records)
+  protected final TezCounter spilledRecordsCounter;
+  // Bytes written as a result of additional spills. The single spill for the
+  // final output data is not considered. (This will be 0 if there's no
+  // additional spills. Compressed size - so may not represent the size in the
+  // sort buffer)
+  protected final TezCounter additionalSpillBytesWritten;
+  
+  protected final TezCounter additionalSpillBytesRead;
+  // Number of additional spills. (This will be 0 if there's no additional
+  // spills)
+  protected final TezCounter numAdditionalSpills;
+
+  public ExternalSorter(TezOutputContext outputContext, Configuration conf, int numOutputs,
+      long initialMemoryAvailable) throws IOException {
     this.outputContext = outputContext;
     this.conf = conf;
     this.partitions = numOutputs;
 
     rfs = ((LocalFileSystem)FileSystem.getLocal(this.conf)).getRaw();
+
+    int assignedMb = (int) (initialMemoryAvailable >> 20);
+    if (assignedMb <= 0) {
+      if (initialMemoryAvailable > 0) { // Rounded down to 0MB - may be > 0 && < 1MB
+        this.availableMemoryMb = 1;
+        LOG.warn("initialAvailableMemory: " + initialMemoryAvailable
+            + " is too low. Rounding to 1 MB");
+      } else {
+        throw new RuntimeException("InitialMemoryAssigned is <= 0: " + initialMemoryAvailable);
+      }
+    } else {
+      this.availableMemoryMb = assignedMb;
+    }
 
     // sorter
     sorter = ReflectionUtils.newInstance(this.conf.getClass(
@@ -115,15 +153,16 @@ public abstract class ExternalSorter {
     keySerializer = serializationFactory.getSerializer(keyClass);
     valSerializer = serializationFactory.getSerializer(valClass);
 
-    //    counters
-    mapOutputByteCounter =
-        outputContext.getCounters().findCounter(TaskCounter.MAP_OUTPUT_BYTES);
-    mapOutputRecordCounter =
-        outputContext.getCounters().findCounter(TaskCounter.MAP_OUTPUT_RECORDS);
-    fileOutputByteCounter =
-        outputContext.getCounters().findCounter(TaskCounter.MAP_OUTPUT_MATERIALIZED_BYTES);
-    spilledRecordsCounter =
-        outputContext.getCounters().findCounter(TaskCounter.SPILLED_RECORDS);
+    //    counters    
+    mapOutputByteCounter = outputContext.getCounters().findCounter(TaskCounter.OUTPUT_BYTES);
+    mapOutputRecordCounter = outputContext.getCounters().findCounter(TaskCounter.OUTPUT_RECORDS);
+    outputBytesWithOverheadCounter = outputContext.getCounters().findCounter(TaskCounter.OUTPUT_BYTES_WITH_OVERHEAD);
+    fileOutputByteCounter = outputContext.getCounters().findCounter(TaskCounter.OUTPUT_BYTES_PHYSICAL);
+    spilledRecordsCounter = outputContext.getCounters().findCounter(TaskCounter.SPILLED_RECORDS);
+    additionalSpillBytesWritten = outputContext.getCounters().findCounter(TaskCounter.ADDITIONAL_SPILLS_BYTES_WRITTEN);
+    additionalSpillBytesRead = outputContext.getCounters().findCounter(TaskCounter.ADDITIONAL_SPILLS_BYTES_READ);
+    numAdditionalSpills = outputContext.getCounters().findCounter(TaskCounter.ADDITIONAL_SPILL_COUNT);
+
     // compression
     if (ConfigUtils.shouldCompressIntermediateOutput(this.conf)) {
       Class<? extends CompressionCodec> codecClass =
@@ -208,5 +247,16 @@ public abstract class ExternalSorter {
 
   public ShuffleHeader getShuffleHeader(int reduce) {
     throw new UnsupportedOperationException("getShuffleHeader isn't supported!");
+  }
+
+  public static long getInitialMemoryRequirement(Configuration conf, long maxAvailableTaskMemory) {
+    int initialMemRequestMb = 
+        conf.getInt(
+            TezJobConfig.TEZ_RUNTIME_IO_SORT_MB, 
+            TezJobConfig.DEFAULT_TEZ_RUNTIME_IO_SORT_MB);
+    Preconditions.checkArgument(initialMemRequestMb != 0, "io.sort.mb should be larger than 0");
+    long reqBytes = initialMemRequestMb << 20;
+    LOG.info("Requested SortBufferSize (io.sort.mb): " + initialMemRequestMb);
+    return reqBytes;
   }
 }

@@ -48,7 +48,7 @@ public interface TezTaskContext {
   public int getDAGAttemptNumber();
 
   /**
-   * Get the index of this Task
+   * Get the index of this Task among the tasks of this vertex
    * @return Task Index
    */
   public int getTaskIndex();
@@ -70,6 +70,13 @@ public interface TezTaskContext {
    * @return Vertex Name
    */
   public String getTaskVertexName();
+  
+  /**
+   * Get the index of this task's vertex in the set of vertices in the DAG. This 
+   * is consistent and valid across all tasks/vertices in the same DAG.
+   * @return index
+   */
+  public int getTaskVertexIndex();
 
   public TezCounters getCounters();
 
@@ -95,7 +102,7 @@ public interface TezTaskContext {
    * Returns an identifier which is unique to the specific Input, Processor or
    * Output
    *
-   * @return
+   * @return a unique identifier
    */
   public String getUniqueIdentifier();
 
@@ -127,4 +134,36 @@ public interface TezTaskContext {
    * @return a ByteBuffer representing the meta-data
    */
   public ByteBuffer getServiceProviderMetaData(String serviceName);
+  
+  /**
+   * Request a specific amount of memory during initialization
+   * (initialize(..*Context)) The requester is notified of allocation via the
+   * provided callback handler.
+   * 
+   * Currently, (post TEZ-668) the caller will be informed about the available
+   * memory after initialization (I/P/O initialize(...)), and before the
+   * start/run invocation. There will be no other invocations on the callback.
+   * 
+   * This method can be called only once by any component. Calling it multiple
+   * times from within the same component will result in an error.
+   * 
+   * Each Input / Output must request memory. For Inputs / Outputs which do not
+   * have a specific ask, a null callback handler can be specified with a
+   * request size of 0.
+   * 
+   * @param size
+   *          request size in bytes.
+   * @param callbackHandler
+   *          the callback handler to be invoked once memory is assigned
+   */
+  public void requestInitialMemory(long size, MemoryUpdateCallback callbackHandler);
+  
+  /**
+   * Gets the total memory available to all components of the running task. This
+   * values will always be constant, and does not factor in any allocations.
+   * 
+   * @return the total available memory for all components of the task
+   */
+  public long getTotalMemoryAvailableToTask();
+    
 }

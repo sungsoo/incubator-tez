@@ -21,10 +21,14 @@ package org.apache.tez.client;
 import java.io.IOException;
 import java.text.NumberFormat;
 import java.util.Map;
+import java.util.UUID;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.security.Credentials;
+import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
 import org.apache.hadoop.yarn.api.records.LocalResource;
@@ -32,6 +36,9 @@ import org.apache.hadoop.yarn.client.api.YarnClient;
 import org.apache.hadoop.yarn.client.api.impl.YarnClientImpl;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.YarnException;
+import org.apache.tez.common.security.JobTokenIdentifier;
+import org.apache.tez.common.security.JobTokenSecretManager;
+import org.apache.tez.common.security.TokenCache;
 import org.apache.tez.dag.api.DAG;
 import org.apache.tez.dag.api.TezConfiguration;
 import org.apache.tez.dag.api.TezException;
@@ -45,6 +52,8 @@ public class TezClient {
   private final YarnConfiguration yarnConf;
   private YarnClient yarnClient;
   Map<String, LocalResource> tezJarResources = null;
+  private JobTokenSecretManager jobTokenSecretManager =
+      new JobTokenSecretManager();
 
   /**
    * <p>
@@ -81,9 +90,22 @@ public class TezClient {
       DAG dag, AMConfiguration amConfig)
           throws TezException, IOException {
     try {
-      ApplicationSubmissionContext appContext =
-          TezClientUtils.createApplicationSubmissionContext(conf, appId, dag,
-              dag.getName(), amConfig, getTezJarResources());
+      // Use the AMCredentials object in client mode, since this won't be re-used.
+      // Ensures we don't fetch credentially unnecessarily if the user has already provided them.
+      Credentials credentials = amConfig.getCredentials();
+      if (credentials == null) {
+        credentials = new Credentials();
+      }
+      TezClientUtils.processTezLocalCredentialsFile(credentials, conf);
+
+      // Add session token for shuffle
+      TezClientUtils.createSessionToken(appId.toString(),
+          jobTokenSecretManager, credentials);
+
+      // Add credentials for tez-local resources.
+      Map<String, LocalResource> tezJarResources = getTezJarResources(credentials);
+      ApplicationSubmissionContext appContext = TezClientUtils.createApplicationSubmissionContext(
+          conf, appId, dag, dag.getName(), amConfig, tezJarResources, credentials);
       LOG.info("Submitting DAG to YARN"
           + ", applicationId=" + appId);
       yarnClient.submitApplication(appContext);
@@ -108,10 +130,10 @@ public class TezClient {
     }
   }
 
-  private synchronized Map<String, LocalResource> getTezJarResources()
+  private synchronized Map<String, LocalResource> getTezJarResources(Credentials credentials)
       throws IOException {
     if (tezJarResources == null) {
-      tezJarResources = TezClientUtils.setupTezJarsLocalResources(conf);
+      tezJarResources = TezClientUtils.setupTezJarsLocalResources(conf, credentials);
     }
     return tezJarResources;
   }

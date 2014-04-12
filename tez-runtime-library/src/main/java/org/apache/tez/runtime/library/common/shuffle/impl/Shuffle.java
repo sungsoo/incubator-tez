@@ -29,6 +29,7 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
+import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocalDirAllocator;
@@ -37,20 +38,25 @@ import org.apache.hadoop.io.compress.DefaultCodec;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.tez.common.TezJobConfig;
+import org.apache.tez.common.TezUtils;
 import org.apache.tez.common.counters.TaskCounter;
 import org.apache.tez.common.counters.TezCounter;
+import org.apache.tez.dag.api.TezConfiguration;
 import org.apache.tez.dag.api.TezUncheckedException;
 import org.apache.tez.runtime.api.Event;
 import org.apache.tez.runtime.api.TezInputContext;
 import org.apache.tez.runtime.library.common.ConfigUtils;
 import org.apache.tez.runtime.library.common.TezRuntimeUtils;
 import org.apache.tez.runtime.library.common.combine.Combiner;
-import org.apache.tez.runtime.library.common.shuffle.server.ShuffleHandler;
 import org.apache.tez.runtime.library.common.sort.impl.TezRawKeyValueIterator;
 import org.apache.tez.runtime.library.shuffle.common.ShuffleUtils;
 
 import com.google.common.base.Preconditions;
 
+/**
+ * Usage: Create instance, setInitialMemoryAllocated(long), run()
+ *
+ */
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
 public class Shuffle implements ExceptionReporter {
@@ -60,33 +66,37 @@ public class Shuffle implements ExceptionReporter {
   
   private final Configuration conf;
   private final TezInputContext inputContext;
+  private final int numInputs;
+  
   private final ShuffleClientMetrics metrics;
 
   private final ShuffleInputEventHandler eventHandler;
   private final ShuffleScheduler scheduler;
   private final MergeManager merger;
-  private Throwable throwable = null;
-  private String throwingThreadName = null;
-  private final int numInputs;
+
   private final SecretKey jobTokenSecret;
   private final CompressionCodec codec;
   private final boolean ifileReadAhead;
   private final int ifileReadAheadLength;
+  
+  private Throwable throwable = null;
+  private String throwingThreadName = null;
 
   private FutureTask<TezRawKeyValueIterator> runShuffleFuture;
 
-  public Shuffle(TezInputContext inputContext, Configuration conf, int numInputs) throws IOException {
+  public Shuffle(TezInputContext inputContext, Configuration conf, int numInputs,
+      long initialMemoryAvailable) throws IOException {
     this.inputContext = inputContext;
     this.conf = conf;
+    this.numInputs = numInputs;
+
     this.metrics = new ShuffleClientMetrics(inputContext.getDAGName(),
         inputContext.getTaskVertexName(), inputContext.getTaskIndex(),
         this.conf, UserGroupInformation.getCurrentUser().getShortUserName());
-            
-    this.numInputs = numInputs;
     
     this.jobTokenSecret = ShuffleUtils
         .getJobTokenSecretFromTokenBytes(inputContext
-            .getServiceConsumerMetaData(ShuffleHandler.MAPREDUCE_SHUFFLE_SERVICEID));
+            .getServiceConsumerMetaData(TezConfiguration.TEZ_SHUFFLE_HANDLER_SERVICE_ID));
     
     if (ConfigUtils.isIntermediateInputCompressed(conf)) {
       Class<? extends CompressionCodec> codecClass =
@@ -113,18 +123,24 @@ public class Shuffle implements ExceptionReporter {
         new LocalDirAllocator(TezJobConfig.LOCAL_DIRS);
 
     // TODO TEZ Get rid of Map / Reduce references.
-    TezCounter shuffledMapsCounter = 
-        inputContext.getCounters().findCounter(TaskCounter.SHUFFLED_MAPS);
+    TezCounter shuffledInputsCounter = 
+        inputContext.getCounters().findCounter(TaskCounter.NUM_SHUFFLED_INPUTS);
     TezCounter reduceShuffleBytes =
-        inputContext.getCounters().findCounter(TaskCounter.REDUCE_SHUFFLE_BYTES);
+        inputContext.getCounters().findCounter(TaskCounter.SHUFFLE_BYTES);
+    TezCounter reduceDataSizeDecompressed = inputContext.getCounters().findCounter(
+        TaskCounter.SHUFFLE_BYTES_DECOMPRESSED);
     TezCounter failedShuffleCounter =
-        inputContext.getCounters().findCounter(TaskCounter.FAILED_SHUFFLE);
+        inputContext.getCounters().findCounter(TaskCounter.NUM_FAILED_SHUFFLE_INPUTS);
     TezCounter spilledRecordsCounter = 
         inputContext.getCounters().findCounter(TaskCounter.SPILLED_RECORDS);
     TezCounter reduceCombineInputCounter =
         inputContext.getCounters().findCounter(TaskCounter.COMBINE_INPUT_RECORDS);
     TezCounter mergedMapOutputsCounter =
         inputContext.getCounters().findCounter(TaskCounter.MERGED_MAP_OUTPUTS);
+    TezCounter bytesShuffedToDisk = inputContext.getCounters().findCounter(
+        TaskCounter.SHUFFLE_BYTES_TO_DISK);
+    TezCounter bytesShuffedToMem = inputContext.getCounters().findCounter(
+        TaskCounter.SHUFFLE_BYTES_TO_MEM);
     
     LOG.info("Shuffle assigned with " + numInputs + " inputs" + ", codec: "
         + (codec == null ? "None" : codec.getClass().getName()) + 
@@ -135,9 +151,12 @@ public class Shuffle implements ExceptionReporter {
           this.conf,
           this.numInputs,
           this,
-          shuffledMapsCounter,
+          shuffledInputsCounter,
           reduceShuffleBytes,
-          failedShuffleCounter);
+          reduceDataSizeDecompressed,
+          failedShuffleCounter,
+          bytesShuffedToDisk,
+          bytesShuffedToMem);
     eventHandler= new ShuffleInputEventHandler(
           inputContext,
           scheduler);
@@ -150,7 +169,11 @@ public class Shuffle implements ExceptionReporter {
           spilledRecordsCounter,
           reduceCombineInputCounter,
           mergedMapOutputsCounter,
-          this);
+          this,
+          initialMemoryAvailable,
+          codec,
+          ifileReadAhead,
+          ifileReadAheadLength);
   }
 
   public void handleEvents(List<Event> events) {
@@ -165,6 +188,8 @@ public class Shuffle implements ExceptionReporter {
     if (runShuffleFuture == null) {
       return false;
     }
+    // TODO This may return true, followed by the reader throwing the actual Exception.
+    // Fix as part of TEZ-919.
     return runShuffleFuture.isDone();
     //return scheduler.isDone() && merger.isMergeComplete();
   }
@@ -195,10 +220,12 @@ public class Shuffle implements ExceptionReporter {
     return kvIter;
   }
 
-  public void run() {
+  public void run() throws IOException {
+    merger.configureAndStart();
     RunShuffleCallable runShuffle = new RunShuffleCallable();
     runShuffleFuture = new FutureTask<TezRawKeyValueIterator>(runShuffle);
-    new Thread(runShuffleFuture, "ShuffleMergeRunner").start();
+    new Thread(runShuffleFuture, "ShuffleMergeRunner ["
+        + TezUtils.cleanVertexName(inputContext.getSourceVertexName() + "]")).start();
   }
   
   private class RunShuffleCallable implements Callable<TezRawKeyValueIterator> {
@@ -221,6 +248,8 @@ public class Shuffle implements ExceptionReporter {
       while (!scheduler.waitUntilDone(PROGRESS_FREQUENCY)) {
         synchronized (this) {
           if (throwable != null) {
+            inputContext.fatalError(throwable, "error in shuffle from thread :"
+                + throwingThreadName);
             throw new ShuffleError("error in shuffle in " + throwingThreadName,
                                    throwable);
           }
@@ -242,20 +271,27 @@ public class Shuffle implements ExceptionReporter {
       try {
         kvIter = merger.close();
       } catch (Throwable e) {
+        inputContext.fatalError(e, "Error while doing final merge ");
         throw new ShuffleError("Error while doing final merge " , e);
       }
       
       // Sanity check
       synchronized (Shuffle.this) {
         if (throwable != null) {
+          inputContext.fatalError(throwable, "error in shuffle from thread :"
+             + throwingThreadName);
           throw new ShuffleError("error in shuffle in " + throwingThreadName,
                                  throwable);
         }
       }
+
+      inputContext.inputIsReady();
+      LOG.info("merge complete for input vertex : " + inputContext.getSourceVertexName());
       return kvIter;
     }
   }
   
+  @Private
   public synchronized void reportException(Throwable t) {
     if (throwable == null) {
       throwable = t;
@@ -276,4 +312,8 @@ public class Shuffle implements ExceptionReporter {
     }
   }
 
+  @Private
+  public static long getInitialMemoryRequirement(Configuration conf, long maxAvailableTaskMemory) {
+    return MergeManager.getInitialMemoryRequirement(conf, maxAvailableTaskMemory);
+  }
 }

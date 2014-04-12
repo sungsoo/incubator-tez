@@ -650,11 +650,11 @@ public class MRRSleepJob extends Configured implements Tool {
       Map<String, String> reduceEnv = new HashMap<String, String>();
       MRHelpers.updateEnvironmentForMRTasks(finalReduceConf, reduceEnv, false);
       finalReduceVertex.setTaskEnvironment(reduceEnv);
-      MRHelpers.addMROutput(finalReduceVertex, reducePayload);
+      MRHelpers.addMROutputLegacy(finalReduceVertex, reducePayload);
       vertices.add(finalReduceVertex);
     } else {
       // Map only job
-      MRHelpers.addMROutput(mapVertex, mapUserPayload);
+      MRHelpers.addMROutputLegacy(mapVertex, mapUserPayload);
     }
 
     for (int i = 0; i < vertices.size(); ++i) {

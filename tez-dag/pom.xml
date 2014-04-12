@@ -19,13 +19,18 @@
   <parent>
     <groupId>org.apache.tez</groupId>
     <artifactId>tez</artifactId>
-    <version>0.3.0-SNAPSHOT</version>
+    <version>0.5.0-incubating-SNAPSHOT</version>
   </parent>
   <properties>
     <tez.component>tez-dag</tez.component>
+    <tez.dag.state.classes>org.apache.tez.dag.app.dag.impl.DAGImpl,
+    org.apache.tez.dag.app.dag.impl.VertexImpl,
+    org.apache.tez.dag.app.dag.impl.TaskImpl,
+    org.apache.tez.dag.app.dag.impl.TaskAttemptImpl</tez.dag.state.classes>
+    <tez.graphviz.title>Tez</tez.graphviz.title>
+    <tez.graphviz.output.file>Tez.gv</tez.graphviz.output.file>
   </properties>
   <artifactId>tez-dag</artifactId>
-  <version>0.3.0-SNAPSHOT</version>
 
   <dependencies>
     <dependency>
@@ -62,7 +67,6 @@
     <dependency>
       <groupId>junit</groupId>
       <artifactId>junit</artifactId>
-      <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.apache.avro</groupId>
@@ -98,6 +102,14 @@
       <groupId>com.google.inject</groupId>
       <artifactId>guice</artifactId>
     </dependency>
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.codehaus.jettison</groupId>
+      <artifactId>jettison</artifactId>
+    </dependency>
   </dependencies>
 
   <build>
@@ -107,18 +119,68 @@
         <artifactId>apache-rat-plugin</artifactId>
       </plugin>
       <plugin>
-        <groupId>org.apache.avro</groupId>
-        <artifactId>avro-maven-plugin</artifactId>
+        <groupId>org.apache.hadoop</groupId>
+        <artifactId>hadoop-maven-plugins</artifactId>
         <executions>
           <execution>
+            <id>compile-protoc</id>
             <phase>generate-sources</phase>
             <goals>
-              <goal>protocol</goal>
+              <goal>protoc</goal>
             </goals>
+            <configuration>
+              <protocVersion>${protobuf.version}</protocVersion>
+              <protocCommand>${protoc.path}</protocCommand>
+              <imports>
+                <param>${basedir}/src/main/proto</param>
+                <param>${basedir}/../tez-api/src/main/proto</param>
+              </imports>
+              <source>
+                <directory>${basedir}/src/main/proto</directory>
+                <includes>
+                  <include>HistoryEvents.proto</include>
+                </includes>
+              </source>
+              <output>${project.build.directory}/generated-sources/java</output>
+            </configuration>
           </execution>
         </executions>
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <profile>
+      <id>visualize</id>
+      <activation>
+        <activeByDefault>false</activeByDefault>
+      </activation>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>exec-maven-plugin</artifactId>
+            <executions>
+              <execution>
+                <phase>compile</phase>
+                <goals>
+                  <goal>java</goal>
+                </goals>
+                <configuration>
+                  <classpathScope>test</classpathScope>
+                  <mainClass>org.apache.hadoop.yarn.state.VisualizeStateMachine</mainClass>
+                  <arguments>
+                    <argument>${tez.graphviz.title}</argument>
+                    <argument>${tez.dag.state.classes}</argument>
+                    <argument>${tez.graphviz.output.file}</argument>
+                  </arguments>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 
 </project>

@@ -18,9 +18,13 @@
 
 package org.apache.tez.dag.api;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+
+import org.apache.hadoop.yarn.api.records.Resource;
+import org.apache.tez.runtime.api.events.RootInputDataInformationEvent;
 
 /**
  * Object with API's to interact with the Tez execution engine
@@ -41,11 +45,37 @@ public interface VertexManagerPluginContext {
   public String getVertexName();
   
   /**
+   * Get the payload set for the plugin
+   * @return user payload
+   */
+  public byte[] getUserPayload();
+  
+  /**
    * Get the number of tasks in the given vertex
    * @param vertexName
    * @return Total number of tasks in this vertex
    */
   public int getVertexNumTasks(String vertexName);
+  
+  /**
+   * Get the resource allocated to a task of this vertex
+   * @return Resource
+   */
+  Resource getVertexTaskResource();
+  
+  /**
+   * Get the total resource allocated to this vertex. If the DAG is running in 
+   * a busy cluster then it may have no resources available dedicated to it. The
+   * DAG may divide its available resource among member vertices.
+   * @return Resource
+   */
+  Resource getTotalAvailableResource();
+  
+  /**
+   * Get the number of nodes in the cluster
+   * @return Number of nodes
+   */
+  int getNumClusterNodes();
   
   /**
    * Set the new parallelism (number of tasks) of this vertex.
@@ -54,11 +84,27 @@ public interface VertexManagerPluginContext {
    * This API can change the parallelism only once. Subsequent attempts will be 
    * disallowed
    * @param parallelism New number of tasks in the vertex
-   * @param sourceEdgeManagers
+   * @param locationHint the placement policy for tasks.
+   * @param sourceEdgeManagers Edge Managers to be updated
    * @return true if the operation was allowed.
    */
-  public boolean setVertexParallelism(int parallelism, 
-      Map<String, EdgeManager> sourceEdgeManagers);
+  public boolean setVertexParallelism(int parallelism, VertexLocationHint locationHint,
+      Map<String, EdgeManagerDescriptor> sourceEdgeManagers);
+  
+  /**
+   * Allows a VertexManagerPlugin to assign Events for Root Inputs
+   * 
+   * For regular Event Routing changes - the EdgeManager should be configured
+   * via the setVertexParallelism method
+   * 
+   * @param inputName
+   *          The input name associated with the event
+   * @param events
+   *          The list of Events to be assigned to various tasks belonging to
+   *          the Vertex. The target index on individual events represents the
+   *          task to which events need to be sent.
+   */
+  public void addRootInputEvents(String inputName, Collection<RootInputDataInformationEvent> events);
   
   /**
    * Notify the vertex to start the given tasks
@@ -72,10 +118,16 @@ public interface VertexManagerPluginContext {
    * @return Names of inputs to this vertex. Maybe null if there are no inputs
    */
   public Set<String> getVertexInputNames();
-  
+
   /**
    * Set the placement hint for tasks in this vertex
+   * 
    * @param locationHint
    */
   public void setVertexLocationHint(VertexLocationHint locationHint);
+
+  /**
+   * @return DAG Attempt number
+   */
+  public int getDAGAttemptNumber();
 }

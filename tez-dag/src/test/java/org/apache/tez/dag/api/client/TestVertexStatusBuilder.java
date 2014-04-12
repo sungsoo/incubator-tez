@@ -18,6 +18,7 @@
 
 package org.apache.tez.dag.api.client;
 
+import org.apache.tez.dag.api.client.VertexStatus.State;
 import org.apache.tez.dag.api.records.DAGProtos;
 import org.apache.tez.dag.app.dag.VertexState;
 import org.junit.Assert;
@@ -32,7 +33,12 @@ public class TestVertexStatusBuilder {
           VertexStatusBuilder.getProtoState(state);
       VertexStatus.State clientState =
           VertexStatus.getState(stateProto);
-      Assert.assertEquals(state.name(), clientState.name());
+      if (state.equals(VertexState.RECOVERING)) {
+        Assert.assertEquals(clientState.name(),
+            State.NEW.name());
+      } else {
+        Assert.assertEquals(state.name(), clientState.name());
+      }
     }
   }
 

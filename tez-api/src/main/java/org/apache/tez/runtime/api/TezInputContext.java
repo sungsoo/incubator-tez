@@ -28,5 +28,20 @@ public interface TezInputContext extends TezTaskContext {
    * @return Name of the Source Vertex
    */
   public String getSourceVertexName();
-
+  
+  /**
+   * Get the index of the input in the set of all inputs for the task. The 
+   * index will be consistent and valid only among the tasks of this vertex.
+   * @return index
+   */
+  public int getInputIndex();
+  
+  /**
+   * Inform the framework that the specific Input is ready for consumption. This
+   * method will typically be invoked as a result of an
+   * Input.inputReadyNotificationRequired invocation.
+   * 
+   * This method can be invoked multiple times.
+   */
+  public void inputIsReady();
 }

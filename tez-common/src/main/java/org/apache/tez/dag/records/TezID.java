@@ -25,13 +25,11 @@ import java.io.IOException;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.io.WritableComparable;
-import org.apache.tez.dag.records.TezTaskAttemptID;
-import org.apache.tez.dag.records.TezTaskID;
 
 /**
  * A general identifier, which internally stores the id
- * as an integer. This is the super class of {@link TezJobID}, 
- * {@link TezTaskID} and {@link TezTaskAttemptID}.
+ * as an integer. This is the super class of {@link TezDAGID}, 
+ * {@link TezVertexID}, {@link TezTaskID}, and {@link TezTaskAttemptID}.
  * 
  * @see TezTaskID
  * @see TezTaskAttemptID

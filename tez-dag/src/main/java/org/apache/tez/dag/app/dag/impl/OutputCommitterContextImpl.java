@@ -18,6 +18,8 @@
 
 package org.apache.tez.dag.app.dag.impl;
 
+import static com.google.common.base.Preconditions.checkNotNull;
+import javax.annotation.Nullable;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.tez.runtime.api.OutputCommitterContext;
 
@@ -29,19 +31,26 @@ public class OutputCommitterContextImpl implements OutputCommitterContext {
   private final String vertexName;
   private final String outputName;
   private final byte[] userPayload;
+  private final int vertexIdx;
 
   public OutputCommitterContextImpl(ApplicationId applicationId,
       int dagAttemptNumber,
       String dagName,
       String vertexName,
       String outputName,
-      byte[] userPayload) {
+      @Nullable byte[] userPayload,
+      int vertexIdx) {
+    checkNotNull(applicationId, "applicationId is null");
+    checkNotNull(dagName, "dagName is null");
+    checkNotNull(vertexName, "vertexName is null");
+    checkNotNull(outputName, "outputName is null");
     this.applicationId = applicationId;
     this.dagAttemptNumber = dagAttemptNumber;
     this.dagName = dagName;
     this.vertexName = vertexName;
     this.outputName = outputName;
     this.userPayload = userPayload;
+    this.vertexIdx = vertexIdx;
   }
 
   @Override
@@ -72,6 +81,11 @@ public class OutputCommitterContextImpl implements OutputCommitterContext {
   @Override
   public byte[] getUserPayload() {
     return userPayload;
+  }
+
+  @Override
+  public int getVertexIndex() {
+    return vertexIdx;
   }
 
 }

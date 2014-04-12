@@ -52,6 +52,7 @@ import org.apache.hadoop.util.GenericOptionsParser;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.LocalResource;
 import org.apache.tez.client.AMConfiguration;
+import org.apache.tez.client.PreWarmContext;
 import org.apache.tez.client.TezClient;
 import org.apache.tez.client.TezClientUtils;
 import org.apache.tez.client.TezSession;
@@ -69,6 +70,7 @@ import org.apache.tez.dag.api.ProcessorDescriptor;
 import org.apache.tez.dag.api.TezConfiguration;
 import org.apache.tez.dag.api.TezException;
 import org.apache.tez.dag.api.Vertex;
+import org.apache.tez.dag.api.VertexLocationHint;
 import org.apache.tez.dag.api.client.DAGClient;
 import org.apache.tez.dag.api.client.DAGStatus;
 import org.apache.tez.dag.api.client.StatusGetOpts;
@@ -83,6 +85,7 @@ import org.apache.tez.mapreduce.processor.reduce.ReduceProcessor;
 import org.apache.tez.runtime.api.TezRootInputInitializer;
 import org.apache.tez.runtime.library.input.ShuffledMergedInputLegacy;
 import org.apache.tez.runtime.library.output.OnFileSortedOutput;
+import org.apache.tez.runtime.library.processor.SleepProcessor;
 
 /**
  * An MRR job built on top of word count to return words sorted by
@@ -216,8 +219,8 @@ public class OrderedWordCount {
     List<Vertex> vertices = new ArrayList<Vertex>();
 
     byte[] mapPayload = MRHelpers.createUserPayloadFromConf(mapStageConf);
-    byte[] mapInputPayload = MRHelpers.createMRInputPayloadWithGrouping(mapPayload, 
-            TextInputFormat.class.getName());
+    byte[] mapInputPayload = MRHelpers.createMRInputPayloadWithGrouping(mapPayload,
+      TextInputFormat.class.getName());
     int numMaps = generateSplitsInClient ? inputSplitInfo.getNumTasks() : -1;
     Vertex mapVertex = new Vertex("initialmap", new ProcessorDescriptor(
         MapProcessor.class.getName()).setUserPayload(mapPayload),
@@ -266,7 +269,7 @@ public class OrderedWordCount {
     Map<String, String> reduceEnv = new HashMap<String, String>();
     MRHelpers.updateEnvironmentForMRTasks(finalReduceConf, reduceEnv, false);
     finalReduceVertex.setTaskEnvironment(reduceEnv);
-    MRHelpers.addMROutput(finalReduceVertex, finalReducePayload);
+    MRHelpers.addMROutputLegacy(finalReduceVertex, finalReducePayload);
     vertices.add(finalReduceVertex);
 
     DAG dag = new DAG("OrderedWordCount" + dagIndex);
@@ -313,6 +316,9 @@ public class OrderedWordCount {
     boolean useTezSession = conf.getBoolean("USE_TEZ_SESSION", true);
     long interJobSleepTimeout = conf.getInt("INTER_JOB_SLEEP_INTERVAL", 0)
         * 1000;
+
+    boolean retainStagingDir = conf.getBoolean("RETAIN_STAGING_DIR", false);
+
     if (((otherArgs.length%2) != 0)
         || (!useTezSession && otherArgs.length != 2)) {
       printUsage();
@@ -408,6 +414,45 @@ public class OrderedWordCount {
             stagingDir, dagIndex, inputPath, outputPath,
             generateSplitsInClient);
 
+        boolean doPreWarm = dagIndex == 1 && useTezSession
+            && conf.getBoolean("PRE_WARM_SESSION", true);
+        int preWarmNumContainers = 0;
+        if (doPreWarm) {
+          preWarmNumContainers = conf.getInt("PRE_WARM_NUM_CONTAINERS", 0);
+          if (preWarmNumContainers <= 0) {
+            doPreWarm = false;
+          }
+        }
+        if (doPreWarm) {
+          LOG.info("Pre-warming Session");
+          VertexLocationHint vertexLocationHint =
+              new VertexLocationHint(null);
+          ProcessorDescriptor sleepProcDescriptor =
+            new ProcessorDescriptor(SleepProcessor.class.getName());
+          SleepProcessor.SleepProcessorConfig sleepProcessorConfig =
+            new SleepProcessor.SleepProcessorConfig(4000);
+          sleepProcDescriptor.setUserPayload(
+            sleepProcessorConfig.toUserPayload());
+          PreWarmContext context = new PreWarmContext(sleepProcDescriptor,
+            dag.getVertex("initialmap").getTaskResource(), preWarmNumContainers,
+              vertexLocationHint);
+
+          Map<String, LocalResource> contextLocalRsrcs =
+            new TreeMap<String, LocalResource>();
+          contextLocalRsrcs.putAll(
+            dag.getVertex("initialmap").getTaskLocalResources());
+          Map<String, String> contextEnv = new TreeMap<String, String>();
+          contextEnv.putAll(dag.getVertex("initialmap").getTaskEnvironment());
+          String contextJavaOpts =
+            dag.getVertex("initialmap").getJavaOpts();
+          context
+            .setLocalResources(contextLocalRsrcs)
+            .setJavaOpts(contextJavaOpts)
+            .setEnvironment(contextEnv);
+
+          tezSession.preWarm(context);
+        }
+
         if (useTezSession) {
           LOG.info("Waiting for TezSession to get into ready state");
           waitForTezSessionReady(tezSession);
@@ -421,7 +466,7 @@ public class OrderedWordCount {
 
         while (true) {
           dagStatus = dagClient.getDAGStatus(statusGetOpts);
-          if(dagStatus.getState() == DAGStatus.State.RUNNING ||
+          if (dagStatus.getState() == DAGStatus.State.RUNNING ||
               dagStatus.getState() == DAGStatus.State.SUCCEEDED ||
               dagStatus.getState() == DAGStatus.State.FAILED ||
               dagStatus.getState() == DAGStatus.State.KILLED ||
@@ -436,9 +481,14 @@ public class OrderedWordCount {
         }
 
 
-        while (dagStatus.getState() == DAGStatus.State.RUNNING) {
-          try {
+        while (dagStatus.getState() != DAGStatus.State.SUCCEEDED &&
+            dagStatus.getState() != DAGStatus.State.FAILED &&
+            dagStatus.getState() != DAGStatus.State.KILLED &&
+            dagStatus.getState() != DAGStatus.State.ERROR) {
+          if (dagStatus.getState() == DAGStatus.State.RUNNING) {
             ExampleDriver.printDAGStatus(dagClient, vNames);
+          }
+          try {
             try {
               Thread.sleep(1000);
             } catch (InterruptedException e) {
@@ -459,9 +509,15 @@ public class OrderedWordCount {
             + dagStatus.getDiagnostics());
         }
       }
+    } catch (Exception e) {
+      LOG.error("Error occurred when submitting/running DAGs", e);
+      throw e;
     } finally {
-      fs.delete(stagingDir, true);
+      if (!retainStagingDir) {
+        fs.delete(stagingDir, true);
+      }
       if (useTezSession) {
+        LOG.info("Shutting down session");
         tezSession.stop();
       }
     }

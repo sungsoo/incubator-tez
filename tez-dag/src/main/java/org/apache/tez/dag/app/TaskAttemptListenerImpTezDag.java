@@ -59,7 +59,7 @@ import org.apache.tez.dag.records.TezVertexID;
 import org.apache.tez.runtime.api.impl.TezEvent;
 import org.apache.tez.runtime.api.impl.TezHeartbeatRequest;
 import org.apache.tez.runtime.api.impl.TezHeartbeatResponse;
-import org.apache.tez.runtime.library.common.security.JobTokenSecretManager;
+import org.apache.tez.common.security.JobTokenSecretManager;
 
 import com.google.common.collect.Maps;
 
@@ -329,11 +329,9 @@ public class TaskAttemptListenerImpTezDag extends AbstractService implements
    * Child checking whether it can commit.
    *
    * <br/>
-   * Commit is a two-phased protocol. First the attempt informs the
-   * ApplicationMaster that it is
-   * {@link #commitPending(TaskAttemptID, TaskStatus)}. Then it repeatedly polls
-   * the ApplicationMaster whether it {@link #canCommit(TaskAttemptID)} This is
-   * a legacy from the centralized commit protocol handling by the JobTracker.
+   * Repeatedly polls the ApplicationMaster whether it
+   * {@link Task#canCommit(TezTaskAttemptID)} This is * a legacy from the
+   * centralized commit protocol handling by the JobTracker.
    */
   @Override
   public boolean canCommit(TezTaskAttemptID taskAttemptId) throws IOException {

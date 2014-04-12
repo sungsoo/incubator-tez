@@ -23,14 +23,19 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.tez.common.RuntimeUtils;
 import org.apache.tez.common.TezUtils;
 import org.apache.tez.dag.api.EdgeManager;
+import org.apache.tez.dag.api.EdgeManagerContext;
+import org.apache.tez.dag.api.EdgeManagerDescriptor;
 import org.apache.tez.dag.api.EdgeProperty;
 import org.apache.tez.dag.api.InputDescriptor;
 import org.apache.tez.dag.api.OutputDescriptor;
 import org.apache.tez.dag.api.TezUncheckedException;
+import org.apache.tez.dag.api.VertexLocationHint;
 import org.apache.tez.dag.api.EdgeProperty.SchedulingType;
 import org.apache.tez.dag.api.VertexManagerPluginContext;
 import org.apache.tez.runtime.api.events.DataMovementEvent;
@@ -41,7 +46,7 @@ import org.junit.Test;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 
-import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 
 import static org.mockito.Mockito.*;
 
@@ -107,15 +112,38 @@ public class TestShuffleVertexManager {
           return null;
       }}).when(mockContext).scheduleVertexTasks(anyList());
     
-    final Map<String, EdgeManager> newEdgeManagers = new HashMap<String, EdgeManager>();
+    final Map<String, EdgeManager> newEdgeManagers =
+        new HashMap<String, EdgeManager>();
     
     doAnswer(new Answer() {
       public Object answer(InvocationOnMock invocation) {
           when(mockContext.getVertexNumTasks(mockManagedVertexId)).thenReturn(2);
           newEdgeManagers.clear();
-          newEdgeManagers.putAll((Map<String, EdgeManager>)invocation.getArguments()[1]);
+          for (Entry<String, EdgeManagerDescriptor> entry :
+              ((Map<String, EdgeManagerDescriptor>)invocation.getArguments()[2]).entrySet()) {
+            EdgeManager edgeManager = RuntimeUtils.createClazzInstance(
+                entry.getValue().getClassName());
+            final byte[] userPayload = entry.getValue().getUserPayload();
+            edgeManager.initialize(new EdgeManagerContext() {
+              @Override
+              public byte[] getUserPayload() {
+                return userPayload;
+              }
+
+              @Override
+              public String getSrcVertexName() {
+                return null;
+              }
+
+              @Override
+              public String getDestVertexName() {
+                return null;
+              }
+            });
+            newEdgeManagers.put(entry.getKey(), edgeManager);
+          }
           return null;
-      }}).when(mockContext).setVertexParallelism(eq(2), anyMap());
+      }}).when(mockContext).setVertexParallelism(eq(2), any(VertexLocationHint.class), anyMap());
     
     // source vertices have 0 tasks. immediate start of all managed tasks
     when(mockContext.getVertexNumTasks(mockSrcVertexId1)).thenReturn(0);
@@ -141,7 +169,7 @@ public class TestShuffleVertexManager {
     manager.onVertexManagerEventReceived(vmEvent);
     manager.onSourceTaskCompleted(mockSrcVertexId1, new Integer(0));
     // managedVertex tasks reduced
-    verify(mockContext, times(0)).setVertexParallelism(anyInt(), anyMap());
+    verify(mockContext, times(0)).setVertexParallelism(anyInt(), any(VertexLocationHint.class), anyMap());
     Assert.assertEquals(0, manager.pendingTasks.size()); // all tasks scheduled
     Assert.assertEquals(4, scheduledTasks.size());
     Assert.assertEquals(1, manager.numSourceTasksCompleted);
@@ -180,7 +208,7 @@ public class TestShuffleVertexManager {
     manager.onVertexManagerEventReceived(vmEvent);
     manager.onSourceTaskCompleted(mockSrcVertexId1, new Integer(1));
     // managedVertex tasks reduced
-    verify(mockContext).setVertexParallelism(eq(2), anyMap());
+    verify(mockContext).setVertexParallelism(eq(2), any(VertexLocationHint.class), anyMap());
     Assert.assertEquals(2, newEdgeManagers.size());
     // TODO improve tests for parallelism
     Assert.assertEquals(0, manager.pendingTasks.size()); // all tasks scheduled
@@ -193,24 +221,39 @@ public class TestShuffleVertexManager {
     
     // more completions dont cause recalculation of parallelism
     manager.onSourceTaskCompleted(mockSrcVertexId2, new Integer(0));
-    verify(mockContext).setVertexParallelism(eq(2), anyMap());
+    verify(mockContext).setVertexParallelism(eq(2), any(VertexLocationHint.class), anyMap());
     Assert.assertEquals(2, newEdgeManagers.size());
     
     EdgeManager edgeManager = newEdgeManagers.values().iterator().next();
-    List<Integer> targets = Lists.newArrayList();
+    Map<Integer, List<Integer>> targets = Maps.newHashMap();
     DataMovementEvent dmEvent = new DataMovementEvent(1, new byte[0]);
-    edgeManager.routeEventToDestinationTasks(dmEvent, 1, 2, targets);
-    Assert.assertEquals(3, dmEvent.getTargetIndex());
-    Assert.assertEquals(0, targets.get(0).intValue());
+    edgeManager.routeDataMovementEventToDestination(dmEvent, 1, 2, targets);
+    Assert.assertEquals(1, targets.size());
+    Map.Entry<Integer, List<Integer>> e = targets.entrySet().iterator().next();
+    Assert.assertEquals(3, e.getKey().intValue());
+    Assert.assertEquals(1, e.getValue().size());
+    Assert.assertEquals(0, e.getValue().get(0).intValue());
     targets.clear();
     dmEvent = new DataMovementEvent(2, new byte[0]);
-    edgeManager.routeEventToDestinationTasks(dmEvent, 0, 2, targets);
-    Assert.assertEquals(0, dmEvent.getTargetIndex());
-    Assert.assertEquals(1, targets.get(0).intValue());    
+    edgeManager.routeDataMovementEventToDestination(dmEvent, 0, 2, targets);
+    Assert.assertEquals(1, targets.size());
+    e = targets.entrySet().iterator().next();
+    Assert.assertEquals(0, e.getKey().intValue());
+    Assert.assertEquals(1, e.getValue().size());
+    Assert.assertEquals(1, e.getValue().get(0).intValue());
+    targets.clear();
+    edgeManager.routeInputSourceTaskFailedEventToDestination(2, 2, targets);
+    Assert.assertEquals(2, targets.size());
+    for (Map.Entry<Integer, List<Integer>> entry : targets.entrySet()) {
+      Assert.assertTrue(entry.getKey().intValue() == 4 || entry.getKey().intValue() == 5);
+      Assert.assertEquals(2, entry.getValue().size());
+      Assert.assertEquals(0, entry.getValue().get(0).intValue());
+      Assert.assertEquals(1, entry.getValue().get(1).intValue());
+    }
   }
   
   @SuppressWarnings({ "unchecked", "rawtypes" })
-  @Test//(timeout = 5000)
+  @Test(timeout = 5000)
   public void testShuffleVertexManagerSlowStart() {
     Configuration conf = new Configuration();
     ShuffleVertexManager manager = null;
@@ -430,7 +473,8 @@ public class TestShuffleVertexManager {
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
-    manager.initialize(payload, context);
+    when(context.getUserPayload()).thenReturn(payload);
+    manager.initialize(context);
     return manager;
   }
 }

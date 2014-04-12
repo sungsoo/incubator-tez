@@ -35,9 +35,6 @@ public enum VertexEventType {
   V_SOURCE_TASK_ATTEMPT_COMPLETED,
   V_SOURCE_VERTEX_STARTED,
   
-  //Producer:Speculator
-  V_ADD_SPEC_ATTEMPT,
-
   //Producer:Task
   V_TASK_COMPLETED,
   V_TASK_RESCHEDULED,
@@ -59,5 +56,11 @@ public enum VertexEventType {
   //Producer: VertexInputInitializer
   V_ROOT_INPUT_INITIALIZED,
   V_ROOT_INPUT_FAILED,
-  
+
+  // Recover Event, Producer:DAG
+  V_RECOVER,
+
+  // Recover Event, Producer:Vertex
+  V_SOURCE_VERTEX_RECOVERED
+
 }

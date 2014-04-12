@@ -44,10 +44,13 @@ import org.apache.hadoop.util.IndexedSortable;
 import org.apache.hadoop.util.IndexedSorter;
 import org.apache.hadoop.util.Progress;
 import org.apache.tez.common.TezJobConfig;
+import org.apache.tez.common.TezUtils;
 import org.apache.tez.runtime.api.TezOutputContext;
 import org.apache.tez.runtime.library.common.ConfigUtils;
 import org.apache.tez.runtime.library.common.sort.impl.IFile.Writer;
 import org.apache.tez.runtime.library.common.sort.impl.TezMerger.Segment;
+
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 @SuppressWarnings({"unchecked", "rawtypes"})
 public class PipelinedSorter extends ExternalSorter {
@@ -60,12 +63,8 @@ public class PipelinedSorter extends ExternalSorter {
   public static final int MAP_OUTPUT_INDEX_RECORD_LENGTH = 24;
 
   private final static int APPROX_HEADER_LENGTH = 150;
-  
-  boolean ifileReadAhead;
-  int ifileReadAheadLength;
-  int ifileBufferSize;
-  
-  int partitionBits;
+
+  private final int partitionBits;
   
   private static final int PARTITION = 0;        // partition offset in acct
   private static final int KEYSTART = 1;         // key offset in acct
@@ -78,22 +77,25 @@ public class PipelinedSorter extends ExternalSorter {
   volatile Throwable sortSpillException = null;
 
   int numSpills = 0;
-  int minSpillsForCombine;
-  private HashComparator hasher;
+  private final int minSpillsForCombine;
+  private final HashComparator hasher;
   // SortSpans  
   private SortSpan span;
   private ByteBuffer largeBuffer;
   // Merger
-  private SpanMerger merger; 
-  private ExecutorService sortmaster;
+  private final SpanMerger merger; 
+  private final ExecutorService sortmaster;
 
-  final ArrayList<TezSpillRecord> indexCacheList =
+  private final ArrayList<TezSpillRecord> indexCacheList =
     new ArrayList<TezSpillRecord>();
   private int totalIndexCacheMemory;
   private int indexCacheMemoryLimit;
 
-  public void initialize(TezOutputContext outputContext, Configuration conf, int numOutputs) throws IOException {
-    super.initialize(outputContext, conf, numOutputs);
+  // TODO Set additional countesr - total bytes written, spills etc.
+
+  public PipelinedSorter(TezOutputContext outputContext, Configuration conf, int numOutputs,
+      long initialMemoryAvailable) throws IOException {
+    super(outputContext, conf, numOutputs, initialMemoryAvailable);
     
     partitionBits = bitcount(partitions)+1;
    
@@ -102,10 +104,7 @@ public class PipelinedSorter extends ExternalSorter {
       this.conf.getFloat(
           TezJobConfig.TEZ_RUNTIME_SORT_SPILL_PERCENT, 
           TezJobConfig.DEFAULT_TEZ_RUNTIME_SORT_SPILL_PERCENT);
-    final int sortmb = 
-        this.conf.getInt(
-            TezJobConfig.TEZ_RUNTIME_IO_SORT_MB, 
-            TezJobConfig.DEFAULT_TEZ_RUNTIME_IO_SORT_MB);
+    final int sortmb = this.availableMemoryMb;
     indexCacheMemoryLimit = this.conf.getInt(TezJobConfig.TEZ_RUNTIME_INDEX_CACHE_MEMORY_LIMIT_BYTES,
                                        TezJobConfig.DEFAULT_TEZ_RUNTIME_INDEX_CACHE_MEMORY_LIMIT_BYTES);
     if (spillper > (float)1.0 || spillper <= (float)0.0) {
@@ -129,7 +128,10 @@ public class PipelinedSorter extends ExternalSorter {
             this.conf.getInt(
                 TezJobConfig.TEZ_RUNTIME_SORT_THREADS, 
                 TezJobConfig.DEFAULT_TEZ_RUNTIME_SORT_THREADS);
-    sortmaster = Executors.newFixedThreadPool(sortThreads);
+    sortmaster = Executors.newFixedThreadPool(sortThreads,
+        new ThreadFactoryBuilder().setDaemon(true)
+        .setNameFormat("Sorter [" + TezUtils.cleanVertexName(outputContext.getDestinationVertexName()) + "] #%d")
+        .build());
 
     // k/v serialization    
     if(comparator instanceof HashComparator) {
@@ -271,7 +273,7 @@ public class PipelinedSorter extends ExternalSorter {
         long segmentStart = out.getPos();
         Writer writer =
           new Writer(conf, out, keyClass, valClass, codec,
-              spilledRecordsCounter);
+              spilledRecordsCounter, null);
         writer.setRLE(merger.needsRLE());
         if (combiner == null) {
           while(kvIter.next()) {
@@ -336,8 +338,6 @@ public class PipelinedSorter extends ExternalSorter {
     //The output stream for the final single output file
     FSDataOutputStream finalOut = rfs.create(finalOutputFile, true, 4096);
 
-    TezMerger.considerFinalMergeForProgress();
-
     final TezSpillRecord spillRec = new TezSpillRecord(partitions);
     final ArrayList<TezSpillRecord> indexCacheList = new ArrayList<TezSpillRecord>();
 
@@ -374,15 +374,15 @@ public class PipelinedSorter extends ExternalSorter {
                      segmentList, mergeFactor,
                      new Path(uniqueIdentifier),
                      (RawComparator)ConfigUtils.getIntermediateOutputKeyComparator(conf), 
-                     nullProgressable, sortSegments,
-                     null, spilledRecordsCounter,
+                     nullProgressable, sortSegments, true,
+                     null, spilledRecordsCounter, null,
                      null); // Not using any Progress in TezMerger. Should just work.
 
       //write merged output to disk
       long segmentStart = finalOut.getPos();
       Writer writer =
           new Writer(conf, finalOut, keyClass, valClass, codec,
-                           spilledRecordsCounter);
+                           spilledRecordsCounter, null);
       writer.setRLE(merger.needsRLE());
       if (combiner == null || numSpills < minSpillsForCombine) {
         TezMerger.writeFile(kvIter, writer, nullProgressable, TezJobConfig.DEFAULT_RECORDS_BEFORE_PROGRESS);
@@ -582,7 +582,7 @@ public class PipelinedSorter extends ExternalSorter {
       }
       int perItem = kvbuffer.position()/items;
       LOG.info(String.format("Span%d.length = %d, perItem = %d", index, length(), perItem));
-      if(remaining.remaining() < NMETA+perItem) {
+      if(remaining.remaining() < METASIZE+perItem) {
         return null;
       }
       return remaining;

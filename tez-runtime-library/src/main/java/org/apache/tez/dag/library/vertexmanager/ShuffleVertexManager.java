@@ -20,6 +20,7 @@ package org.apache.tez.dag.library.vertexmanager;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -31,6 +32,8 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.tez.common.TezUtils;
 import org.apache.tez.dag.api.EdgeManager;
+import org.apache.tez.dag.api.EdgeManagerContext;
+import org.apache.tez.dag.api.EdgeManagerDescriptor;
 import org.apache.tez.dag.api.EdgeProperty;
 import org.apache.tez.dag.api.InputDescriptor;
 import org.apache.tez.dag.api.TezUncheckedException;
@@ -39,11 +42,12 @@ import org.apache.tez.dag.api.VertexManagerPluginContext;
 import org.apache.tez.dag.api.EdgeProperty.DataMovementType;
 import org.apache.tez.runtime.api.Event;
 import org.apache.tez.runtime.api.events.DataMovementEvent;
-import org.apache.tez.runtime.api.events.InputFailedEvent;
 import org.apache.tez.runtime.api.events.InputReadErrorEvent;
 import org.apache.tez.runtime.api.events.VertexManagerEvent;
+import org.apache.tez.runtime.library.shuffle.impl.ShuffleUserPayloads.ShuffleEdgeManagerConfigPayloadProto;
 import org.apache.tez.runtime.library.shuffle.impl.ShuffleUserPayloads.VertexManagerEventPayloadProto;
 
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.protobuf.InvalidProtocolBufferException;
 
@@ -56,12 +60,22 @@ public class ShuffleVertexManager implements VertexManagerPlugin {
   
   private static final String TEZ_AM_PREFIX = "tez.am.";
   
+  /**
+   * In case of a ScatterGather connection, the fraction of source tasks which
+   * should complete before tasks for the current vertex are scheduled
+   */
   public static final String
   TEZ_AM_SHUFFLE_VERTEX_MANAGER_MIN_SRC_FRACTION = TEZ_AM_PREFIX
   + "shuffle-vertex-manager.min-src-fraction";
   public static final float
     TEZ_AM_SHUFFLE_VERTEX_MANAGER_MIN_SRC_FRACTION_DEFAULT = 0.25f;
   
+  /**
+   * In case of a ScatterGather connection, once this fraction of source tasks
+   * have completed, all tasks on the current vertex can be scheduled. Number of
+   * tasks ready for scheduling on the current vertex scales linearly between
+   * min-fraction and max-fraction
+   */
   public static final String
     TEZ_AM_SHUFFLE_VERTEX_MANAGER_MAX_SRC_FRACTION = TEZ_AM_PREFIX
     + "shuffle-vertex-manager.max-src-fraction";
@@ -112,22 +126,39 @@ public class ShuffleVertexManager implements VertexManagerPlugin {
   }
   
   
-  public class CustomShuffleEdgeManager implements EdgeManager {
+  public static class CustomShuffleEdgeManager implements EdgeManager {
     int numSourceTaskOutputs;
     int numDestinationTasks;
     int basePartitionRange;
     int remainderRangeForLastShuffler;
-    
-    CustomShuffleEdgeManager(int numSourceTaskOutputs, int numDestinationTasks,
-        int basePartitionRange, int remainderPartitionForLastShuffler) {
-      this.numSourceTaskOutputs = numSourceTaskOutputs;
-      this.numDestinationTasks = numDestinationTasks;
-      this.basePartitionRange = basePartitionRange;
-      this.remainderRangeForLastShuffler = remainderPartitionForLastShuffler;
+
+    public CustomShuffleEdgeManager() {
     }
 
     @Override
-    public int getNumDestinationTaskInputs(int numSourceTasks, 
+    public void initialize(EdgeManagerContext edgeManagerContext) {
+      // Nothing to do. This class isn't currently designed to be used at the DAG API level.
+      byte[] userPayload = edgeManagerContext.getUserPayload();
+      if (userPayload == null
+        || userPayload.length == 0) {
+        throw new RuntimeException("Could not initialize CustomShuffleEdgeManager"
+            + " from provided user payload");
+      }
+      CustomShuffleEdgeManagerConfig config;
+      try {
+        config = CustomShuffleEdgeManagerConfig.fromUserPayload(userPayload);
+      } catch (InvalidProtocolBufferException e) {
+        throw new RuntimeException("Could not initialize CustomShuffleEdgeManager"
+            + " from provided user payload", e);
+      }
+      this.numSourceTaskOutputs = config.numSourceTaskOutputs;
+      this.numDestinationTasks = config.numDestinationTasks;
+      this.basePartitionRange = config.basePartitionRange;
+      this.remainderRangeForLastShuffler = config.remainderRangeForLastShuffler;
+    }
+
+    @Override
+    public int getNumDestinationTaskPhysicalInputs(int numSourceTasks, 
         int destinationTaskIndex) {
       int partitionRange = 1;
       if(destinationTaskIndex < numDestinationTasks-1) {
@@ -139,14 +170,14 @@ public class ShuffleVertexManager implements VertexManagerPlugin {
     }
 
     @Override
-    public int getNumSourceTaskOutputs(int numDestinationTasks, 
+    public int getNumSourceTaskPhysicalOutputs(int numDestinationTasks, 
         int sourceTaskIndex) {
       return numSourceTaskOutputs;
     }
     
     @Override
-    public void routeEventToDestinationTasks(DataMovementEvent event,
-        int sourceTaskIndex, int numDestinationTasks, List<Integer> taskIndices) {
+    public void routeDataMovementEventToDestination(DataMovementEvent event,
+        int sourceTaskIndex, int numDestinationTasks, Map<Integer, List<Integer>> inputIndicesToTaskIndices) {
       int sourceIndex = event.getSourceIndex();
       int destinationTaskIndex = sourceIndex/basePartitionRange;
       int partitionRange = 1;
@@ -161,32 +192,46 @@ public class ShuffleVertexManager implements VertexManagerPlugin {
           sourceTaskIndex * partitionRange 
           + sourceIndex % partitionRange;
       
-      event.setTargetIndex(targetIndex);
-      taskIndices.add(new Integer(destinationTaskIndex));
+      inputIndicesToTaskIndices.put(new Integer(targetIndex),
+          Collections.singletonList(new Integer(destinationTaskIndex)));
     }
-
+    
     @Override
-    public void routeEventToDestinationTasks(InputFailedEvent event,
-        int sourceTaskIndex, int numDestinationTasks, List<Integer> taskIndices) {
-      int sourceIndex = event.getSourceIndex();
-      int destinationTaskIndex = sourceIndex/basePartitionRange;
-      int partitionRange = 1;
-      if(destinationTaskIndex < numDestinationTasks-1) {
-        partitionRange = basePartitionRange;
+    public void routeInputSourceTaskFailedEventToDestination(int sourceTaskIndex, 
+        int numDestinationTasks, 
+        Map<Integer, List<Integer>> inputIndicesToTaskIndices) {
+      if (remainderRangeForLastShuffler < basePartitionRange) {
+        List<Integer> lastTask = Collections.singletonList(
+            new Integer(numDestinationTasks-1));
+        List<Integer> otherTasks = Lists.newArrayListWithCapacity(numDestinationTasks-1);
+        for (int i=0; i<numDestinationTasks-1; ++i) {
+          otherTasks.add(new Integer(i));
+        }
+        
+        int startOffset = sourceTaskIndex * basePartitionRange;
+        for (int i=0; i<basePartitionRange; ++i) {
+          inputIndicesToTaskIndices.put(new Integer(startOffset+i), otherTasks);
+        }
+        startOffset = sourceTaskIndex * remainderRangeForLastShuffler;
+        for (int i=0; i<remainderRangeForLastShuffler; ++i) {
+          inputIndicesToTaskIndices.put(new Integer(startOffset+i), lastTask);
+        }
       } else {
-        partitionRange = remainderRangeForLastShuffler;
+        // all tasks have same pattern
+        List<Integer> allTasks = Lists.newArrayListWithCapacity(numDestinationTasks);
+        for (int i=0; i<numDestinationTasks; ++i) {
+          allTasks.add(new Integer(i));
+        }
+        int startOffset = sourceTaskIndex * basePartitionRange;
+        for (int i=0; i<basePartitionRange; ++i) {
+          inputIndicesToTaskIndices.put(new Integer(startOffset+i), allTasks);
+        }
       }
-      int targetIndex = 
-          sourceTaskIndex * partitionRange 
-          + sourceIndex % partitionRange;
-      
-      event.setTargetIndex(targetIndex);
-      taskIndices.add(new Integer(destinationTaskIndex));
     }
 
     @Override
-    public int routeEventToSourceTasks(int destinationTaskIndex,
-        InputReadErrorEvent event) {
+    public int routeInputErrorEventToSource(InputReadErrorEvent event,
+        int destinationTaskIndex) {
       int partitionRange = 1;
       if(destinationTaskIndex < numDestinationTasks-1) {
         partitionRange = basePartitionRange;
@@ -197,9 +242,47 @@ public class ShuffleVertexManager implements VertexManagerPlugin {
     }
 
     @Override
-    public int getDestinationConsumerTaskNumber(int sourceTaskIndex,
+    public int getNumDestinationConsumerTasks(int sourceTaskIndex,
         int numDestTasks) {
       return numDestTasks;
+    }
+   }
+
+  private static class CustomShuffleEdgeManagerConfig {
+    int numSourceTaskOutputs;
+    int numDestinationTasks;
+    int basePartitionRange;
+    int remainderRangeForLastShuffler;
+
+    private CustomShuffleEdgeManagerConfig(int numSourceTaskOutputs,
+        int numDestinationTasks,
+        int basePartitionRange,
+        int remainderRangeForLastShuffler) {
+      this.numSourceTaskOutputs = numSourceTaskOutputs;
+      this.numDestinationTasks = numDestinationTasks;
+      this.basePartitionRange = basePartitionRange;
+      this.remainderRangeForLastShuffler = remainderRangeForLastShuffler;
+    }
+
+    public byte[] toUserPayload() {
+      return ShuffleEdgeManagerConfigPayloadProto.newBuilder()
+          .setNumSourceTaskOutputs(numSourceTaskOutputs)
+          .setNumDestinationTasks(numDestinationTasks)
+          .setBasePartitionRange(basePartitionRange)
+          .setRemainderRangeForLastShuffler(remainderRangeForLastShuffler)
+          .build().toByteArray();
+    }
+
+    public static CustomShuffleEdgeManagerConfig fromUserPayload(
+        byte[] userPayload) throws InvalidProtocolBufferException {
+      ShuffleEdgeManagerConfigPayloadProto proto =
+          ShuffleEdgeManagerConfigPayloadProto.parseFrom(userPayload);
+      return new CustomShuffleEdgeManagerConfig(
+          proto.getNumSourceTaskOutputs(),
+          proto.getNumDestinationTasks(),
+          proto.getBasePartitionRange(),
+          proto.getRemainderRangeForLastShuffler());
+
     }
   }
 
@@ -328,18 +411,23 @@ public class ShuffleVertexManager implements VertexManagerPlugin {
           
     if(finalTaskParallelism < currentParallelism) {
       // final parallelism is less than actual parallelism
-      Map<String, EdgeManager> edgeManagers = new HashMap<String, EdgeManager>(
-          bipartiteSources.size());
+      Map<String, EdgeManagerDescriptor> edgeManagers =
+          new HashMap<String, EdgeManagerDescriptor>(bipartiteSources.size());
       for(String vertex : bipartiteSources.keySet()) {
         // use currentParallelism for numSourceTasks to maintain original state
         // for the source tasks
-        edgeManagers.put(vertex, new CustomShuffleEdgeManager(
-            currentParallelism, finalTaskParallelism, basePartitionRange,
-            ((remainderRangeForLastShuffler > 0) ?
-                remainderRangeForLastShuffler : basePartitionRange)));
+        CustomShuffleEdgeManagerConfig edgeManagerConfig =
+            new CustomShuffleEdgeManagerConfig(
+                currentParallelism, finalTaskParallelism, basePartitionRange,
+                ((remainderRangeForLastShuffler > 0) ?
+                    remainderRangeForLastShuffler : basePartitionRange));
+        EdgeManagerDescriptor edgeManagerDescriptor =
+            new EdgeManagerDescriptor(CustomShuffleEdgeManager.class.getName());
+        edgeManagerDescriptor.setUserPayload(edgeManagerConfig.toUserPayload());
+        edgeManagers.put(vertex, edgeManagerDescriptor);
       }
       
-      context.setVertexParallelism(finalTaskParallelism, edgeManagers);
+      context.setVertexParallelism(finalTaskParallelism, null, edgeManagers);
       updatePendingTasks();      
     }
   }
@@ -366,7 +454,7 @@ public class ShuffleVertexManager implements VertexManagerPlugin {
     context.scheduleVertexTasks(scheduledTasks);
   }
   
-  void schedulePendingTasks() {    
+  void schedulePendingTasks() {
     int numPendingTasks = pendingTasks.size();
     if (numPendingTasks == 0) {
       return;
@@ -429,16 +517,16 @@ public class ShuffleVertexManager implements VertexManagerPlugin {
   }
 
   @Override
-  public void initialize(byte[] payload, VertexManagerPluginContext context) {
+  public void initialize(VertexManagerPluginContext context) {
     Configuration conf;
     try {
-      conf = TezUtils.createConfFromUserPayload(payload);
+      conf = TezUtils.createConfFromUserPayload(context.getUserPayload());
     } catch (IOException e) {
       throw new TezUncheckedException(e);
     }
     
     this.context = context;
-    
+
     this.slowStartMinSrcCompletionFraction = conf
         .getFloat(
             ShuffleVertexManager.TEZ_AM_SHUFFLE_VERTEX_MANAGER_MIN_SRC_FRACTION,

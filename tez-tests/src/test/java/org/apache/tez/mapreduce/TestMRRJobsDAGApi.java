@@ -18,14 +18,35 @@
 
 package org.apache.tez.mapreduce;
 
+import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.rmi.RemoteException;
+import java.security.CodeSource;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
+
+import javax.tools.JavaCompiler;
+import javax.tools.JavaFileObject;
+import javax.tools.JavaFileObject.Kind;
+import javax.tools.SimpleJavaFileObject;
+import javax.tools.StandardJavaFileManager;
+import javax.tools.StandardLocation;
+import javax.tools.ToolProvider;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -51,18 +72,20 @@ import org.apache.tez.client.TezClientUtils;
 import org.apache.tez.client.TezSession;
 import org.apache.tez.client.TezSessionConfiguration;
 import org.apache.tez.client.TezSessionStatus;
+import org.apache.tez.common.RuntimeUtils;
 import org.apache.tez.dag.api.DAG;
 import org.apache.tez.dag.api.Edge;
 import org.apache.tez.dag.api.EdgeProperty;
+import org.apache.tez.dag.api.EdgeProperty.DataMovementType;
+import org.apache.tez.dag.api.EdgeProperty.DataSourceType;
+import org.apache.tez.dag.api.EdgeProperty.SchedulingType;
 import org.apache.tez.dag.api.InputDescriptor;
 import org.apache.tez.dag.api.OutputDescriptor;
 import org.apache.tez.dag.api.ProcessorDescriptor;
 import org.apache.tez.dag.api.TezConfiguration;
 import org.apache.tez.dag.api.TezException;
+import org.apache.tez.dag.api.TezUncheckedException;
 import org.apache.tez.dag.api.Vertex;
-import org.apache.tez.dag.api.EdgeProperty.DataMovementType;
-import org.apache.tez.dag.api.EdgeProperty.DataSourceType;
-import org.apache.tez.dag.api.EdgeProperty.SchedulingType;
 import org.apache.tez.dag.api.client.DAGClient;
 import org.apache.tez.dag.api.client.DAGStatus;
 import org.apache.tez.dag.api.client.DAGStatus.State;
@@ -73,13 +96,17 @@ import org.apache.tez.mapreduce.examples.MRRSleepJob.MRRSleepJobPartitioner;
 import org.apache.tez.mapreduce.examples.MRRSleepJob.SleepInputFormat;
 import org.apache.tez.mapreduce.examples.MRRSleepJob.SleepMapper;
 import org.apache.tez.mapreduce.examples.MRRSleepJob.SleepReducer;
+import org.apache.tez.mapreduce.examples.UnionExample;
+import org.apache.tez.mapreduce.hadoop.InputSplitInfo;
 import org.apache.tez.mapreduce.hadoop.MRHelpers;
 import org.apache.tez.mapreduce.hadoop.MRJobConfig;
-import org.apache.tez.mapreduce.hadoop.InputSplitInfo;
 import org.apache.tez.mapreduce.hadoop.MultiStageMRConfToTezTranslator;
 import org.apache.tez.mapreduce.processor.map.MapProcessor;
 import org.apache.tez.mapreduce.processor.reduce.ReduceProcessor;
+import org.apache.tez.mapreduce.protos.MRRuntimeProtos.MRInputUserPayloadProto;
+import org.apache.tez.runtime.api.Event;
 import org.apache.tez.runtime.api.TezRootInputInitializer;
+import org.apache.tez.runtime.api.TezRootInputInitializerContext;
 import org.apache.tez.runtime.library.input.ShuffledMergedInputLegacy;
 import org.apache.tez.runtime.library.output.OnFileSortedOutput;
 import org.apache.tez.test.MiniTezCluster;
@@ -117,6 +144,7 @@ public class TestMRRJobsDAGApi {
           1, 1, 1);
       Configuration conf = new Configuration();
       conf.set("fs.defaultFS", remoteFs.getUri().toString()); // use HDFS
+      conf.setInt("yarn.nodemanager.delete.debug-delay-sec", 20000);
       mrrTezCluster.init(conf);
       mrrTezCluster.start();
     }
@@ -168,6 +196,140 @@ public class TestMRRJobsDAGApi {
     Assert.assertEquals(DAGStatus.State.SUCCEEDED, finalState);
   }
 
+  // Submit 2 jobs via RPC using a custom initializer. The second job is submitted with an
+  // additional local resource, which is verified by the initializer.
+  @Test(timeout = 120000)
+  public void testAMRelocalization() throws Exception {
+    Path relocPath = new Path("/tmp/relocalizationfilefound");
+    if (remoteFs.exists(relocPath)) {
+      remoteFs.delete(relocPath, true);
+    }
+    TezSession tezSession = createTezSession();
+
+    State finalState = testMRRSleepJobDagSubmitCore(true, false, false,
+        tezSession, true, MRInputAMSplitGeneratorRelocalizationTest.class, null);
+    Assert.assertEquals(DAGStatus.State.SUCCEEDED, finalState);
+    Assert.assertFalse(remoteFs.exists(new Path("/tmp/relocalizationfilefound")));
+
+    // Start the second job with some additional resources.
+
+    // Create a test jar directly to HDFS
+    LOG.info("Creating jar for relocalization test");
+    Path relocFilePath = new Path("/tmp/test.jar");
+    relocFilePath = remoteFs.makeQualified(relocFilePath);
+    OutputStream os = remoteFs.create(relocFilePath, true);
+    createTestJar(os, RELOCALIZATION_TEST_CLASS_NAME);
+
+    // Also upload one of Tez's own JARs to HDFS and add as resource; should be ignored
+    Path tezAppJar = new Path(MiniTezCluster.APPJAR);
+    Path tezAppJarRemote = remoteFs.makeQualified(new Path("/tmp/" + tezAppJar.getName()));
+    remoteFs.copyFromLocalFile(tezAppJar, tezAppJarRemote);
+
+    Map<String, LocalResource> additionalResources = new HashMap<String, LocalResource>();
+    additionalResources.put("test.jar", createLrObjFromPath(relocFilePath));
+    additionalResources.put("TezAppJar.jar", createLrObjFromPath(tezAppJarRemote));
+
+    Assert.assertEquals(TezSessionStatus.READY,
+        tezSession.getSessionStatus());
+    finalState = testMRRSleepJobDagSubmitCore(true, false, false,
+        tezSession, true, MRInputAMSplitGeneratorRelocalizationTest.class, additionalResources);
+    Assert.assertEquals(DAGStatus.State.SUCCEEDED, finalState);
+    Assert.assertEquals(TezSessionStatus.READY,
+        tezSession.getSessionStatus());
+    Assert.assertTrue(remoteFs.exists(new Path("/tmp/relocalizationfilefound")));
+
+    stopAndVerifyYarnApp(tezSession);
+  }
+
+  private void stopAndVerifyYarnApp(TezSession tezSession) throws TezException,
+      IOException, YarnException {
+    ApplicationId appId = tezSession.getApplicationId();
+    tezSession.stop();
+    Assert.assertEquals(TezSessionStatus.SHUTDOWN,
+        tezSession.getSessionStatus());
+
+    YarnClient yarnClient = YarnClient.createYarnClient();
+    yarnClient.init(mrrTezCluster.getConfig());
+    yarnClient.start();
+
+    while (true) {
+      ApplicationReport appReport = yarnClient.getApplicationReport(appId);
+      if (appReport.getYarnApplicationState().equals(
+          YarnApplicationState.FINISHED)
+          || appReport.getYarnApplicationState().equals(
+              YarnApplicationState.FAILED)
+          || appReport.getYarnApplicationState().equals(
+              YarnApplicationState.KILLED)) {
+        break;
+      }
+    }
+
+    ApplicationReport appReport = yarnClient.getApplicationReport(appId);
+    Assert.assertEquals(YarnApplicationState.FINISHED,
+        appReport.getYarnApplicationState());
+    Assert.assertEquals(FinalApplicationStatus.SUCCEEDED,
+        appReport.getFinalApplicationStatus());
+  }
+
+
+  @Test(timeout = 120000)
+  public void testAMRelocalizationConflict() throws Exception {
+    Path relocPath = new Path("/tmp/relocalizationfilefound");
+    if (remoteFs.exists(relocPath)) {
+      remoteFs.delete(relocPath, true);
+    }
+
+    // Run a DAG w/o a file.
+    TezSession tezSession = createTezSession();
+    State finalState = testMRRSleepJobDagSubmitCore(true, false, false,
+        tezSession, true, MRInputAMSplitGeneratorRelocalizationTest.class, null);
+    Assert.assertEquals(DAGStatus.State.SUCCEEDED, finalState);
+    Assert.assertFalse(remoteFs.exists(relocPath));
+
+    // Create a bogus TezAppJar directly to HDFS
+    LOG.info("Creating jar for relocalization test");
+    Path tezAppJar = new Path(MiniTezCluster.APPJAR);
+    Path tezAppJarRemote = remoteFs.makeQualified(new Path("/tmp/" + tezAppJar.getName()));
+    OutputStream os = remoteFs.create(tezAppJarRemote, true);
+    createTestJar(os, RELOCALIZATION_TEST_CLASS_NAME);
+
+    Map<String, LocalResource> additionalResources = new HashMap<String, LocalResource>();
+    additionalResources.put("TezAppJar.jar", createLrObjFromPath(tezAppJarRemote));
+
+    try {
+      testMRRSleepJobDagSubmitCore(true, false, false,
+        tezSession, true, MRInputAMSplitGeneratorRelocalizationTest.class, additionalResources);
+      Assert.fail("should have failed");
+    } catch (Exception ex) {
+      // expected
+    }
+
+    stopAndVerifyYarnApp(tezSession);
+  }
+
+  private LocalResource createLrObjFromPath(Path filePath) {
+    return LocalResource.newInstance(ConverterUtils.getYarnUrlFromPath(filePath),
+        LocalResourceType.FILE, LocalResourceVisibility.PRIVATE, 0, 0);
+  }
+
+  private TezSession createTezSession() throws IOException, TezException {
+    Map<String, String> commonEnv = createCommonEnv();
+    Path remoteStagingDir = remoteFs.makeQualified(new Path("/tmp", String
+        .valueOf(new Random().nextInt(100000))));
+    remoteFs.mkdirs(remoteStagingDir);
+    TezConfiguration tezConf = new TezConfiguration(mrrTezCluster.getConfig());
+    tezConf.set(TezConfiguration.TEZ_AM_STAGING_DIR, remoteStagingDir.toString());
+
+    Map<String, LocalResource> amLocalResources = new HashMap<String, LocalResource>();
+
+    AMConfiguration amConfig = new AMConfiguration(commonEnv, amLocalResources, tezConf, null);
+    TezSessionConfiguration tezSessionConfig = new TezSessionConfiguration(amConfig, tezConf);
+    TezSession tezSession = new TezSession("testrelocalizationsession", tezSessionConfig);
+    tezSession.start();
+    Assert.assertEquals(TezSessionStatus.INITIALIZING, tezSession.getSessionStatus());
+    return tezSession;
+  }
+
   // Submits a DAG to AM via RPC after AM has started
   @Test(timeout = 120000)
   public void testMultipleMRRSleepJobViaSession() throws IOException,
@@ -195,42 +357,17 @@ public class TestMRRJobsDAGApi {
         tezSession.getSessionStatus());
 
     State finalState = testMRRSleepJobDagSubmitCore(true, false, false,
-        tezSession, false);
+        tezSession, false, null, null);
     Assert.assertEquals(DAGStatus.State.SUCCEEDED, finalState);
     Assert.assertEquals(TezSessionStatus.READY,
         tezSession.getSessionStatus());
     finalState = testMRRSleepJobDagSubmitCore(true, false, false,
-        tezSession, false);
+        tezSession, false, null, null);
     Assert.assertEquals(DAGStatus.State.SUCCEEDED, finalState);
     Assert.assertEquals(TezSessionStatus.READY,
         tezSession.getSessionStatus());
 
-    ApplicationId appId = tezSession.getApplicationId();
-    tezSession.stop();
-    Assert.assertEquals(TezSessionStatus.SHUTDOWN,
-        tezSession.getSessionStatus());
-
-    YarnClient yarnClient = YarnClient.createYarnClient();
-    yarnClient.init(mrrTezCluster.getConfig());
-    yarnClient.start();
-
-    while (true) {
-      ApplicationReport appReport = yarnClient.getApplicationReport(appId);
-      if (appReport.getYarnApplicationState().equals(
-          YarnApplicationState.FINISHED)
-          || appReport.getYarnApplicationState().equals(
-              YarnApplicationState.FAILED)
-          || appReport.getYarnApplicationState().equals(
-              YarnApplicationState.KILLED)) {
-        break;
-      }
-    }
-
-    ApplicationReport appReport = yarnClient.getApplicationReport(appId);
-    Assert.assertEquals(YarnApplicationState.FINISHED,
-        appReport.getYarnApplicationState());
-    Assert.assertEquals(FinalApplicationStatus.SUCCEEDED,
-        appReport.getFinalApplicationStatus());
+    stopAndVerifyYarnApp(tezSession);
   }
 
   // Submits a simple 5 stage sleep job using tez session. Then kills it.
@@ -265,7 +402,7 @@ public class TestMRRJobsDAGApi {
       InterruptedException, TezException, ClassNotFoundException,
       YarnException {
     return testMRRSleepJobDagSubmitCore(dagViaRPC, killDagWhileRunning,
-        closeSessionBeforeSubmit, null, genSplitsInAM);
+        closeSessionBeforeSubmit, null, genSplitsInAM, null, null);
   }
 
   private Map<String, String> createCommonEnv() {
@@ -278,7 +415,9 @@ public class TestMRRJobsDAGApi {
       boolean killDagWhileRunning,
       boolean closeSessionBeforeSubmit,
       TezSession reUseTezSession,
-      boolean genSplitsInAM) throws IOException,
+      boolean genSplitsInAM,
+      Class<? extends TezRootInputInitializer> initializerClass,
+      Map<String, LocalResource> additionalLocalResources) throws IOException,
       InterruptedException, TezException, ClassNotFoundException,
       YarnException {
     LOG.info("\n\n\nStarting testMRRSleepJobDagSubmit().");
@@ -354,8 +493,10 @@ public class TestMRRJobsDAGApi {
     
     DAG dag = new DAG("testMRRSleepJobDagSubmit");
     int stage1NumTasks = genSplitsInAM ? -1 : inputSplitInfo.getNumTasks();
-    Class<? extends TezRootInputInitializer> inputInitializerClazz = genSplitsInAM ? MRInputAMSplitGenerator.class
+    Class<? extends TezRootInputInitializer> inputInitializerClazz =
+        genSplitsInAM ? (initializerClass == null ? MRInputAMSplitGenerator.class : initializerClass)
         : null;
+    LOG.info("Using initializer class: " + initializerClass);
     Vertex stage1Vertex = new Vertex("map", new ProcessorDescriptor(
         MapProcessor.class.getName()).setUserPayload(stage1Payload),
         stage1NumTasks, Resource.newInstance(256, 1));
@@ -367,7 +508,7 @@ public class TestMRRJobsDAGApi {
     Vertex stage3Vertex = new Vertex("reduce", new ProcessorDescriptor(
         ReduceProcessor.class.getName()).setUserPayload(stage3Payload),
         1, Resource.newInstance(256, 1));
-    MRHelpers.addMROutput(stage3Vertex, stage3Payload);
+    MRHelpers.addMROutputLegacy(stage3Vertex, stage3Payload);
 
     Map<String, LocalResource> commonLocalResources = new HashMap<String, LocalResource>();
     Map<String, String> commonEnv = createCommonEnv();
@@ -492,7 +633,7 @@ public class TestMRRJobsDAGApi {
     if(dagViaRPC) {
       LOG.info("Submitting dag to tez session with appId="
           + tezSession.getApplicationId());
-      dagClient = tezSession.submitDAG(dag);
+      dagClient = tezSession.submitDAG(dag, additionalLocalResources);
       Assert.assertEquals(TezSessionStatus.RUNNING,
           tezSession.getSessionStatus());
     }
@@ -529,5 +670,94 @@ public class TestMRRJobsDAGApi {
 
     return LocalResource.newInstance(resourceURL, type, visibility,
         resourceSize, resourceModificationTime);
+  }
+  
+  @Test(timeout = 60000)
+  public void testVertexGroups() throws Exception {
+    LOG.info("Running Group Test");
+    Path inPath = new Path(TEST_ROOT_DIR, "in");
+    Path outPath = new Path(TEST_ROOT_DIR, "out");
+    FSDataOutputStream out = remoteFs.create(inPath);
+    OutputStreamWriter writer = new OutputStreamWriter(out);
+    writer.write("abcd ");
+    writer.write("efgh ");
+    writer.write("abcd ");
+    writer.write("efgh ");
+    writer.close();
+    out.close();
+    
+    UnionExample job = new UnionExample();
+    if (job.run(inPath.toString(), outPath.toString(), mrrTezCluster.getConfig())) {
+      LOG.info("Success VertexGroups Test");
+    } else {
+      throw new TezUncheckedException("VertexGroups Test Failed");
+    }
+  }
+
+  // This class should not be used by more than one test in a single run, since
+  // the path it writes to is not dynamic.
+  private static String RELOCALIZATION_TEST_CLASS_NAME = "AMClassloadTestDummyClass";
+  public static class MRInputAMSplitGeneratorRelocalizationTest extends MRInputAMSplitGenerator {
+    public List<Event> initialize(TezRootInputInitializerContext rootInputContext)  throws Exception {
+      MRInputUserPayloadProto userPayloadProto = MRHelpers
+          .parseMRInputPayload(rootInputContext.getUserPayload());
+      Configuration conf = MRHelpers.createConfFromByteString(userPayloadProto
+          .getConfigurationBytes());
+
+      try {
+        RuntimeUtils.getClazz(RELOCALIZATION_TEST_CLASS_NAME);
+        LOG.info("Class found");
+        FileSystem fs = FileSystem.get(conf);
+        fs.mkdirs(new Path("/tmp/relocalizationfilefound"));
+      } catch (TezUncheckedException e) {
+        LOG.info("Class not found");
+      }
+
+      return super.initialize(rootInputContext);
+    }
+  }
+  
+  private static void createTestJar(OutputStream outStream, String dummyClassName)
+      throws URISyntaxException, IOException {
+    JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+    JavaFileObject srcFileObject = new SimpleJavaFileObjectImpl(
+        URI.create("string:///" + dummyClassName + Kind.SOURCE.extension), Kind.SOURCE);
+    StandardJavaFileManager fileManager = compiler.getStandardFileManager(null, null, null);
+    compiler.getTask(null, fileManager, null, null, null, Collections.singletonList(srcFileObject))
+        .call();
+
+    JavaFileObject javaFileObject = fileManager.getJavaFileForOutput(StandardLocation.CLASS_OUTPUT,
+        dummyClassName, Kind.CLASS, null);
+
+    File classFile = new File(dummyClassName + Kind.CLASS.extension);
+
+    JarOutputStream jarOutputStream = new JarOutputStream(outStream);
+    JarEntry jarEntry = new JarEntry(classFile.getName());
+    jarEntry.setTime(classFile.lastModified());
+    jarOutputStream.putNextEntry(jarEntry);
+
+    InputStream in = javaFileObject.openInputStream();
+    byte buffer[] = new byte[4096];
+    while (true) {
+      int nRead = in.read(buffer, 0, buffer.length);
+      if (nRead <= 0)
+        break;
+      jarOutputStream.write(buffer, 0, nRead);
+    }
+    in.close();
+    jarOutputStream.close();
+    javaFileObject.delete();
+  }
+
+  private static class SimpleJavaFileObjectImpl extends SimpleJavaFileObject {
+    static final String code = "public class AMClassloadTestDummyClass {}";
+    SimpleJavaFileObjectImpl(URI uri, Kind kind) {
+      super(uri, kind);
+    }
+
+    @Override
+    public CharSequence getCharContent(boolean ignoreEncodingErrors) {
+      return code;
+    }
   }
 }
